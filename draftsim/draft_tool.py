@@ -14,9 +14,18 @@ priced by 500 simulated finishes of the draft (pick_sim.py):
     the combined VOR/ADP board, filling the rest of the count
 
 and listed best first -- by what your team is worth at the end of the draft,
-not by where the board rates the player. You always get the full count: a
-position you cannot legally add, a capped QB or a kicker before the final
-pick, buys another player off the board rather than costing you an option.
+not by where the board rates the player. Two measures of that are simulated
+and both are shown: the projected points of the lineup you could start, and
+the total value over replacement of all fifteen you would hold. Ranking is on
+the points until nothing on offer can reach your starting lineup, and on the
+VOR after that, since a bench player's points never enter the lineup total
+and leave every option finishing the same team. In the twelfth round ten
+options spread 1.1 points and 33 VOR. A star marks the column that ordered
+the table, and the spread, the gap and best% are all read off it.
+
+You always get the full count: a position you cannot legally add, a capped QB
+or a kicker before the final pick, buys another player off the board rather
+than costing you an option.
 Kickers and defenses are held back until the last three rounds, where they
 belong; before that the board fills past them, and `p <name>` overrides it.
 
@@ -330,38 +339,76 @@ def show_board(draft, pos=None, n=15):
         )
 
 
-def by_points(opts, res):
-    """Options and their simulations, best expected finish first.
+PTS, VOR = 0, 1  # the two measures pick_sim.Engine.chunk returns
 
-    Sorted once, before anything is printed, so the number you type at the
-    prompt is the number in the table. The sort is stable, which leaves
-    options that finish *exactly* level -- a deep bench pick that never
-    reaches the starting lineup, so every one of them scores the same -- in
-    the order they were proposed, positional leaders ahead of the board.
+
+def rank_options(draft, opts, res):
+    """Options and their simulations, best first. Returns the measure used.
+
+    Ranking is normally on what the team is worth at the end of the draft:
+    the projected points of the lineup it can start. That stops working the
+    moment none of the options can reach the starting lineup, because a bench
+    player's points never enter the lineup total -- every option comes back
+    with the same team, and the order among them is arbitrary. Measured over
+    a draft, ten options spread 23 to 59 points while a starting slot is open
+    and under one and a half once the board is offering bench.
+
+    So when nothing on offer can start, the ranking pivots to the roster's
+    total VOR at the end of the draft -- still simulated, still the same 500
+    finished drafts, just counting all fifteen players rather than the nine
+    who start. That separates bench picks the lineup total cannot: in the
+    twelfth round the same ten options spread 0.4 points and 24.6 VOR.
+
+    Rounds that offer a defense or a kicker go back to points, since those
+    are starters and the pick does move the lineup.
+
+    The sort is stable either way, so options that come out exactly level
+    stay in the order they were proposed, positional leaders ahead of board.
     """
-    order = np.argsort(-res.mean(axis=1), kind="stable")
-    return [opts[k] for k in order], res[order]
+    counts = draft.counts[draft.user_team]
+    startable = any(
+        draft.eng.fills_a_slot(counts, draft.eng.pc[i]) for i, _ in opts
+    )
+    measure = PTS if startable else VOR
+    order = np.argsort(-res[measure].mean(axis=1), kind="stable")
+    return [opts[k] for k in order], res[:, order], measure
 
 
-def show_options(draft, opts, res):
-    """The options table: what each pick is worth, and how often it wins."""
+def show_options(draft, opts, res, measure=PTS):
+    """The options table: what each pick is worth, and how often it wins.
+
+    Both measures are shown, and a star marks the one that ordered the table
+    -- see rank_options. Everything derived from a measure follows it: the
+    spread, the gap to the best option, and how often an option came out
+    ahead are all read off whichever column is starred.
+    """
     e = draft.eng.entries
     adp = draft.eng.adp
-    mean = res.mean(axis=1)
-    p10, p90 = np.percentile(res, [10, 90], axis=1)
+    pts = res[PTS].mean(axis=1)
+    vor = res[VOR].mean(axis=1)
+    ranked = res[measure]
+    mean = ranked.mean(axis=1)
+    p10, p90 = np.percentile(ranked, [10, 90], axis=1)
     best = mean.max()
-    wins = np.bincount(res.argmax(axis=0), minlength=len(opts)) / res.shape[1]
+    # Options level in a simulation share the credit for it. argmax would
+    # hand the whole of it to whichever was listed first, which in the rounds
+    # where every option finishes the same team reads as one winning outright.
+    top = ranked == ranked.max(axis=0)
+    wins = (top / top.sum(axis=0)).sum(axis=1) / ranked.shape[1]
     rank = {i: k for k, i in enumerate(draft.my_board(), start=1)}
+    head = ["team pts", "team vor"]
+    head[measure] += "*"
 
     print(
-        "\n  %3s %-7s %-31s %5s %6s %9s %6s %6s %8s %6s"
+        "\n  %3s %-7s %-30s %4s %5s %8s %8s %5s %5s %7s %5s"
         % (
             "#",
             "option",
             "player",
             "rank",
             "adp",
-            "team pts",
+            head[0],
+            head[1],
             "p10",
             "p90",
             "vs best",
@@ -372,19 +419,26 @@ def show_options(draft, opts, res):
         gap = mean[k - 1] - best
         a = adp[i]
         print(
-            "  %3d %-7s %-31s %5d %6s %9.1f %6.0f %6.0f %8s %5.0f%%"
+            "  %3d %-7s %-30s %4d %5s %8.1f %8.1f %5.0f %5.0f %7s %4.0f%%"
             % (
                 k,
                 why,
-                fmt_player(e[i]),
+                fmt_player(e[i], 21),
                 rank[i],
                 "-" if a != a else "%.1f" % a,
-                mean[k - 1],
+                pts[k - 1],
+                vor[k - 1],
                 p10[k - 1],
                 p90[k - 1],
                 "best" if gap == 0 else "%+.1f" % gap,
                 100 * wins[k - 1],
             )
+        )
+    if measure == VOR:
+        print(
+            "\n  * ranked on the roster's total simulated VOR: none of"
+            " these can reach your\n    starting lineup, so team pts is"
+            " the same team whichever you take"
         )
 
 
@@ -647,8 +701,8 @@ class Console:
             d, [i for i, _ in self.opts], self.n_sims, self.rng, self.pool
         )
         print("done")
-        self.opts, self.res = by_points(self.opts, res)
-        show_options(d, self.opts, self.res)
+        self.opts, self.res, self.basis = rank_options(d, self.opts, res)
+        show_options(d, self.opts, self.res, self.basis)
 
     def _resimulate(self):
         if self.res is None:

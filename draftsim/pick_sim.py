@@ -236,6 +236,15 @@ class Engine:
         vor_rank = np.empty(b.n_vor, dtype=np.float64)
         vor_rank[np.argsort(-vor, kind="stable")] = np.arange(1, b.n_vor + 1)
 
+        # The VOR itself, not just its rank: what a player is worth over the
+        # replacement at his position, for every player in the pool. A player
+        # with no projection scores nothing, so his VOR is the whole of that
+        # replacement level negated -- a real number, and a bad one, which is
+        # what he is worth. roster_vor sums these.
+        self.vor = [
+            self.proj[i] - repl[e["pos"]] for i, e in enumerate(self.entries)
+        ]
+
         self.rank_vor = np.where(
             b.vor_row >= 0, vor_rank[b.vor_row], b.n_vor + 1.0
         )
@@ -270,6 +279,36 @@ class Engine:
                 spare += v[k:]
         spare.sort(reverse=True)
         return total + sum(spare[: self.lg.n_flex])
+
+    def fills_a_slot(self, counts, pc):
+        """Would a player at this position start, or take the flex?
+
+        The question draft_tool asks before it decides how to rank a pick.
+        A roster that can still seat a position has something to gain in
+        projected points from taking one; a roster that cannot is drafting a
+        bench player, whose points do not enter the lineup and so cannot
+        tell one option from another.
+        """
+        if counts[pc] < self.starts[pc]:
+            return True
+        if pc not in self.flex_codes:
+            return False
+        spare = sum(
+            max(0, counts[c] - self.starts[c]) for c in self.flex_codes
+        )
+        return spare < self.lg.n_flex
+
+    def roster_vor(self, roster):
+        """Total value over replacement of everyone on the roster.
+
+        The measure that still says something once the starting lineup is
+        settled. lineup_points counts starters, so a bench pick moves it not
+        at all and every option comes back with the same team; this counts
+        all fifteen, so a better bench player is worth more than a worse one,
+        and the pick's effect on who is left for the rest of the draft shows
+        up too.
+        """
+        return sum(self.vor[i] for i in roster)
 
     def lineup_slots(self, roster):
         """Which slot each player fills: START, FLEX or bench.
@@ -372,16 +411,21 @@ class Engine:
         return roster
 
     def chunk(self, snap, candidates, n_sims, rng):
-        """Points for every candidate over `n_sims` shared futures.
+        """Both measures for every candidate over `n_sims` shared futures.
 
-        Returns an (options x sims) array. Every candidate is finished off the
-        same drawn board, which is the whole point: the options differ by the
-        pick and not by the draw. This is the unit of work a worker process
-        gets, and the unit evaluate runs inline when there is no pool.
+        Returns a (2 x options x sims) array: the starting lineup's projected
+        points, then the roster's total VOR. The first is what the pick is
+        worth while it can still reach the lineup, the second what it is
+        worth once it cannot -- see draft_tool.rank_options.
+
+        Every candidate is finished off the same drawn board, which is the
+        whole point: the options differ by the pick and not by the draw. This
+        is the unit of work a worker process gets, and the unit evaluate runs
+        inline when there is no pool.
         """
         live = self.live_by_pos(snap.gone)
         me = snap.user_team
-        out = np.empty((len(candidates), n_sims), dtype=np.float64)
+        out = np.empty((2, len(candidates), n_sims), dtype=np.float64)
 
         for s in range(n_sims):
             vr, sr, weights = self.draw(rng)
@@ -391,17 +435,17 @@ class Engine:
                 gone[cand] = 1
                 counts = [list(c) for c in snap.counts]
                 counts[me][self.pc[cand]] += 1
-                out[k, s] = self.lineup_points(
-                    self.finish(
-                        boards,
-                        scores,
-                        snap.order,
-                        counts,
-                        me,
-                        snap.roster + [cand],
-                        gone,
-                    )
+                roster = self.finish(
+                    boards,
+                    scores,
+                    snap.order,
+                    counts,
+                    me,
+                    snap.roster + [cand],
+                    gone,
                 )
+                out[0, k, s] = self.lineup_points(roster)
+                out[1, k, s] = self.roster_vor(roster)
         return out
 
     def evaluate(self, state, candidates, n_sims, rng, pool=None):
@@ -440,4 +484,4 @@ class Engine:
             if pool is None
             else list(pool.map(tasks))
         )
-        return np.concatenate(parts, axis=1)
+        return np.concatenate(parts, axis=2)
