@@ -14,9 +14,9 @@ dependencies = [
     "scipy>=1.10",
     "pyarrow>=14",
 ]
-# Projections come out of the ffanalytics R package, so R and ffanalytics have
-# to be installed too -- neither is a Python dependency and pip cannot get
-# them. See the README; draftsim.projections says so plainly if R is missing.
+# Projections come out of the ffanalytics R package, but a prebuilt copy is
+# published in the repo and fetched on demand, so R is only needed to build
+# fresher ones with --refresh-projections. See the README.
 
 [project.scripts]
 draftsim = "draftsim.draft_tool:main"

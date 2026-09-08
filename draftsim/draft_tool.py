@@ -710,7 +710,16 @@ def run(draft, n_sims, rng, auto=False, mock=True, pool=None):
     return Console(draft, n_sims, rng, auto, mock, pool).run()
 
 
-def main():
+def main(argv=None):
+    """Run a draft. `argv` defaults to the command line.
+
+    Passing it explicitly is what lets the tool be driven from somewhere
+    that has no command line of its own -- a notebook, say, where sys.argv
+    belongs to the kernel:
+
+        from draftsim.draft_tool import main
+        main(["--slot", "5", "--sims", "500"])
+    """
     ap = add_projection_args(
         add_adp_args(
             add_league_args(
@@ -775,7 +784,7 @@ def main():
         help="take the highest-scoring option every time, no "
         "prompt -- for checking the tool end to end",
     )
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     lg = league_from_args(a)
     if not 1 <= a.slot <= lg.n_teams:

@@ -14,16 +14,19 @@ python -m draftsim --slot 5
 directory as it stands. Requires Python 3.11+, numpy 1.25+ (for
 `Generator.spawn`), scipy and pyarrow.
 
-**It also needs R**, with the [ffanalytics](https://github.com/FantasyFootballAnalytics/ffanalytics)
-package installed — that is where projections come from, and pip cannot
-install it:
+**R is optional.** Projections come from the ffanalytics R package, but a
+prebuilt copy is published in `data/` and fetched automatically, so the tool
+runs anywhere with a network connection — a borrowed laptop, a Colab notebook
+— with no R at all. Install R and
+[ffanalytics](https://github.com/FantasyFootballAnalytics/ffanalytics) only if
+you want to build fresher projections yourself with `--refresh-projections`:
 
 ```r
 install.packages("remotes")
 remotes::install_github("FantasyFootballAnalytics/ffanalytics")
 ```
 
-`Rscript` must be on the path, or `DRAFTSIM_RSCRIPT` set to it.
+`Rscript` must then be on the path, or `DRAFTSIM_RSCRIPT` set to it.
 
 ## Layout
 
@@ -77,13 +80,18 @@ The default is the last 14 days, all draft sizes, all non-auction formats —
 the same query the page loads with. Boards are cached as plain TSVs keyed by
 the window and filters.
 
-**Projections** are pulled out of ffanalytics by running R:
+**Projections** are looked for in three places, in order: the local cache,
+the copy published in this repo's `data/`, and only then a fresh scrape out of
+R. The middle step is what makes R optional.
 
 ```bash
 python -m draftsim --projections-season 2026    # default: the current season
 python -m draftsim --projections-week 3         # 0, the preseason, by default
 python -m draftsim --refresh-projections        # re-scrape, ignoring the cache
 ```
+
+`--refresh-projections` skips both caches and insists on the scrape, which is
+the only way to get numbers newer than what is published.
 
 `projections.py` holds an R program that calls `scrape_data()` and
 `projections_table()` — once for the points board and once with

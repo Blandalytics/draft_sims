@@ -25,8 +25,19 @@ a category worth zero points is not returned.
 
 A scrape takes about two minutes and hits six sites per position, so the
 result is cached under DRAFTSIM_CACHE (or ~/.cache/draftsim) as JSON, keyed by
-season and week. `--refresh-projections` forces a new one; a failed scrape
-falls back on the newest cache rather than leaving you with nothing.
+season and week, and is looked for in three places in this order:
+
+    the local cache, if this machine has already built or fetched it
+    the copy published at PUBLISHED, which is that same JSON committed to the
+      project, and is what lets the tool run where R is not installed -- a
+      borrowed laptop, a Colab notebook -- with no R, no ffanalytics and no
+      two-minute wait
+    a fresh scrape out of R
+
+`--refresh-projections` skips both caches and insists on the scrape, which is
+the only way to get numbers newer than what is published. Whatever arrives is
+kept locally, so twelve worker processes cost one fetch between them, and a
+scrape that fails falls back on any cache rather than leaving you nothing.
 
 One column ffanalytics does not have is `pid`, the id the ADP board uses --
 its own ids come from a different registry. That join is made here instead, on
@@ -48,6 +59,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+import urllib.request
 from collections import namedtuple
 from datetime import date
 from pathlib import Path
@@ -58,6 +70,13 @@ from .adp import path_from_args as adp_path_from_args
 POSITIONS = ("QB", "RB", "WR", "TE", "K", "DST")
 TIMEOUT = 900  # a scrape is ~2 minutes; this is a wide safety margin
 SEASON_STARTS = 3  # from March, "this season" means this calendar year
+
+# Where this project publishes the cache it built. Same JSON the local cache
+# holds, under the same filename, so a machine with no R -- a borrowed
+# laptop, a Colab notebook -- has projections to draft on without one.
+PUBLISHED = (
+    "https://raw.githubusercontent.com/Blandalytics/draft_sims/main/data/"
+)
 POINTS_MARK = "##POINTS"
 STATS_MARK = "##STATS"
 
@@ -298,38 +317,87 @@ def attach_ids(points, adp_path):
     return matched
 
 
-def load(season=None, week=0, adp_path=None, refresh=False, quiet=False):
-    """The two tables, from cache or a fresh scrape, with pids attached."""
-    season = season or season_now()
-    path = cache_path(season, week)
-    if path.exists() and not refresh:
-        blob = json.loads(path.read_text(encoding="utf-8"))
-    else:
-        try:
-            points, stats = scrape(season, week, quiet=quiet)
-        except Exception as exc:
-            stale = newest_cached()
-            if stale is None:
-                raise SystemExit(
-                    "could not build projections (%s), and nothing cached to "
-                    "fall back on." % exc
-                ) from exc
+def published_url(season, week):
+    return PUBLISHED + cache_path(season, week).name
+
+
+def fetch_published(season, week, quiet=False):
+    """The cache this project publishes, or None if it is not there.
+
+    This is what makes the tool run somewhere R is not, which is most
+    borrowed machines and every Colab notebook: the numbers a scrape would
+    have produced, already scraped, fetched over HTTP and then kept locally
+    like any other cache.
+    """
+    url = published_url(season, week)
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as r:
+            blob = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:
+        if not quiet:
             print(
-                "projections: %s\n  falling back on %s" % (exc, stale),
+                "projections: nothing published for %d week %d (%s)"
+                % (season, week, exc),
                 file=sys.stderr,
             )
-            blob = json.loads(stale.read_text(encoding="utf-8"))
+        return None
+    if not quiet:
+        print("projections: %d players from %s" % (len(blob["points"]), url))
+    return blob
+
+
+def _write_cache(blob, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(blob), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _build(season, week, path, quiet):
+    """Scrape, and keep the result. On failure, any cache beats none."""
+    try:
+        points, stats = scrape(season, week, quiet=quiet)
+    except Exception as exc:
+        stale = newest_cached()
+        if stale is None:
+            raise SystemExit(
+                "could not build projections (%s), and nothing cached or "
+                "published to fall back on." % exc
+            ) from exc
+        print(
+            "projections: %s\n  falling back on %s" % (exc, stale),
+            file=sys.stderr,
+        )
+        return json.loads(stale.read_text(encoding="utf-8"))
+    blob = {"season": season, "week": week, "points": points, "stats": stats}
+    _write_cache(blob, path)
+    return blob
+
+
+def load(season=None, week=0, adp_path=None, refresh=False, quiet=False):
+    """The two tables, with pids attached, from the nearest source that has
+    them.
+
+    In order: the local cache, then the copy this project publishes, then a
+    fresh scrape out of R. The middle step is the one that matters away from
+    a machine with ffanalytics on it -- and it is cached locally on arrival,
+    so it is fetched once however many worker processes want it.
+
+    `refresh` skips both caches and insists on a scrape, which is the only
+    way to get numbers newer than what is published.
+    """
+    season = season or season_now()
+    path = cache_path(season, week)
+    blob = None
+    if not refresh:
+        if path.exists():
+            blob = json.loads(path.read_text(encoding="utf-8"))
         else:
-            blob = {
-                "season": season,
-                "week": week,
-                "points": points,
-                "stats": stats,
-            }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(blob), encoding="utf-8")
-            os.replace(tmp, path)
+            blob = fetch_published(season, week, quiet)
+            if blob is not None:
+                _write_cache(blob, path)
+    if blob is None:
+        blob = _build(season, week, path, quiet)
     if adp_path is not None:
         attach_ids(blob["points"], adp_path)
     return Projections(
