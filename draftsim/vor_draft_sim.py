@@ -3,9 +3,10 @@
 Each draft draws one simulated season for every player by sampling each
 scored component stat independently,
     stat ~ Normal(stat, stat_sd), clipped at 0,
-from the `average` avg_type lines in projections_stats.csv, then scoring the
-draw with Yahoo default values (0.5 PPR). So a player's points come from his
-own passing/rushing/receiving draws rather than from one aggregate number,
+from the `average` avg_type rows projections.py pulls out of ffanalytics,
+then scoring the draw with Yahoo default values (0.5 PPR). So a player's
+points come from his own passing/rushing/receiving draws rather than from
+one aggregate number,
 and each draft gets its own board. Replacement levels are then recomputed from
 that draft's sampled points -- VOR is only meaningful against the sampled
 board, not against the static projection -- and teams take the highest-VOR
@@ -47,7 +48,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import PROJECTION_STATS, PROJECTIONS
+from . import projections
 from .league import (
     BASELINE_OVERRIDE,
     DEFAULT,
@@ -58,9 +59,8 @@ from .league import (
     league_from_args,
 )
 
-SRC = PROJECTIONS
-STATS_SRC = PROJECTION_STATS
-STATS_AVG_TYPE = "average"
+POINTS_AVG_TYPE = "robust"  # the reconciliation the points board uses
+STATS_AVG_TYPE = "average"  # and the one its component stats use
 
 # Yahoo default scoring, applied to the sampled component stats.
 # help.yahoo.com/kb/default-league-settings-fantasy-football-sln6489.html
@@ -101,50 +101,55 @@ SEED = 20260905
 # add_league_args.
 
 
-def load_players():
+def load_players(source):
+    """The projected points board, off what ffanalytics reconciled.
+
+    `source` is a projections.Projections; its points table carries every
+    avg_type the package computes, and the board is built on the robust one.
+    """
     players = []
-    with open(SRC, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            pos = r["position"]
-            if pos not in DRAFTABLE:
-                continue
-            try:
-                pts, sd = float(r["points"]), float(r["sd_pts"])
-            except (ValueError, KeyError):
-                continue
-            players.append(
-                {
-                    "id": r["id"],
-                    "pid": r.get("pid", ""),  # ADP.tsv player id
-                    "name": (r["first_name"] + " " + r["last_name"]).strip(),
-                    "pos": pos,
-                    "team": r["team"],
-                    "points": pts,
-                    "sd_pts": sd,
-                    # The projection exactly as published. load_board
-                    # overwrites `points` with what this file's own
-                    # components imply, which is what a VOR board must
-                    # be priced on; anything reporting a projection
-                    # rather than ranking on it wants the source's
-                    # number -- see pick_sim.Engine.
-                    "src_points": pts,
-                    "adp": r.get("adp") or "",
-                }
-            )
+    for r in source.points:
+        pos = r["position"]
+        if r["avg_type"] != POINTS_AVG_TYPE or pos not in DRAFTABLE:
+            continue
+        try:
+            pts, sd = float(r["points"]), float(r["sd_pts"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        players.append(
+            {
+                "id": r["id"],
+                "pid": r.get("pid", ""),  # the ADP board's id, joined on
+                "name": (r["first_name"] + " " + r["last_name"]).strip(),
+                "pos": pos,
+                "team": r["team"],
+                "points": pts,
+                "sd_pts": sd,
+                # The projection exactly as published. load_board overwrites
+                # `points` with what this player's own components imply,
+                # which is what a VOR board must be priced on; anything
+                # reporting a projection rather than ranking on it wants the
+                # source's number -- see pick_sim.Engine.
+                "src_points": pts,
+                "adp": r.get("adp") or "",
+            }
+        )
     return players
 
 
-def load_stats():
+def load_stats(source):
     """Component stat means and SDs, keyed by player id.
 
-    Only the columns Yahoo actually scores are kept, and only those present in
-    the file. A blank stat is 0; a blank SD is 0, i.e. that component is
-    treated as certain rather than dropped.
+    Only the columns Yahoo actually scores are kept, and only those the
+    package returned -- a category worth no points is not aggregated. A blank
+    stat is 0, and so is a blank SD, which treats that component as certain
+    rather than dropping the player over it.
     """
-    with open(STATS_SRC, encoding="utf-8-sig") as f:
-        rows = [
-            r for r in csv.DictReader(f) if r["avg_type"] == STATS_AVG_TYPE
-        ]
+    rows = [r for r in source.stats if r["avg_type"] == STATS_AVG_TYPE]
+    if not rows:
+        raise SystemExit(
+            "projections carried no %s stat rows" % STATS_AVG_TYPE
+        )
     cols = [c for c in YAHOO_POINTS if c in rows[0] and c + "_sd" in rows[0]]
 
     def num(v):
@@ -264,15 +269,16 @@ class Roster:
         self._refresh()
 
 
-def load_board():
+def load_board(source=None):
     """The player pool, its component stat matrices and the scoring weights.
 
     Split out of run() so combined_draft.py can draw a VOR board per draft the
     same way this simulator does. Each player's `points`/`sd_pts` are
     overwritten with the mean and SD implied by his components.
     """
-    players = load_players()
-    stat_cols, stats = load_stats()
+    source = source or projections.load()
+    players = load_players(source)
+    stat_cols, stats = load_stats(source)
 
     dropped = [p for p in players if p["id"] not in stats]
     players = [p for p in players if p["id"] in stats]
@@ -522,8 +528,8 @@ def describe(players, pos_of, stat_cols, dropped, lg):
     )
 
 
-def run(lg=DEFAULT):
-    players, pos_of, MU, SD, W, stat_cols, dropped = load_board()
+def run(lg=DEFAULT, source=None):
+    players, pos_of, MU, SD, W, stat_cols, dropped = load_board(source)
     describe(players, pos_of, stat_cols, dropped, lg)
 
     rng = np.random.default_rng(SEED)
@@ -549,7 +555,10 @@ def run(lg=DEFAULT):
 if __name__ == "__main__":
     import argparse
 
-    ap = add_league_args(
-        argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = projections.add_projection_args(
+        add_league_args(
+            argparse.ArgumentParser(description=__doc__.split("\n")[0])
+        )
     )
-    run(league_from_args(ap.parse_args()))
+    _a = ap.parse_args()
+    run(league_from_args(_a), projections.from_args(_a))

@@ -55,6 +55,8 @@ from . import adp, draft_sim, vor_draft_sim
 from .adp import add_adp_args
 from .combine_ranks import first_last
 from .league import DRAFTABLE, add_league_args, league_from_args
+from .projections import add_projection_args
+from .projections import from_args as projections_from_args
 
 OUT_PICKS = "combined_draft_results.parquet"
 OUT_SUMM = "combined_draft_summary.csv"
@@ -74,7 +76,7 @@ class Board:
     costs two draws, two argsorts and a blend, with no reallocation.
     """
 
-    def __init__(self, lg, matched_only=False, adp_path=None):
+    def __init__(self, lg, matched_only=False, adp_path=None, source=None):
         self.lg = lg
         # ADP side: one fitted skew normal per player, as draft_sim fits
         # them. `adp_path` is resolved once by whoever owns the run and
@@ -92,7 +94,7 @@ class Board:
             self.W,
             _cols,
             _dropped,
-        ) = vor_draft_sim.load_board()
+        ) = vor_draft_sim.load_board(source)
         self.n_vor = len(self.vor_players)
         self.n_sim = len(self.sim_players)
         # replacement lookup is per-position, so map it onto players once
@@ -269,11 +271,13 @@ COLS = [f.name for f in SCHEMA]
 
 
 def parse_args():
-    ap = add_adp_args(
-        add_league_args(
-            argparse.ArgumentParser(
-                description=__doc__,
-                formatter_class=argparse.RawDescriptionHelpFormatter,
+    ap = add_projection_args(
+        add_adp_args(
+            add_league_args(
+                argparse.ArgumentParser(
+                    description=__doc__,
+                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                )
             )
         )
     )
@@ -484,7 +488,10 @@ def show_earliest(summ):
 def main():
     a = parse_args()
     lg = league_from_args(a)
-    board = Board(lg, a.matched_only, adp.path_from_args(a))
+    board_path = adp.path_from_args(a)
+    board = Board(
+        lg, a.matched_only, board_path, projections_from_args(a, board_path)
+    )
     describe(board, lg, a)
 
     agg, last = simulate(board, lg, a)

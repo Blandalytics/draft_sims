@@ -5,6 +5,10 @@ and one player pool:
 
     league          the league's shape and its roster rules, which everything
                     else is priced against
+    adp             the market, scraped from nfc.shgn.com over a window that
+                    defaults to the last fourteen days
+    projections     projected points and the component stats behind them,
+                    pulled out of the ffanalytics R package
     draft_sim       drafts off simulated ADP: a skew normal per player, fitted
                     to his published ADP, range and pick count
     vor_draft_sim   drafts off sampled projections: a season drawn per player
@@ -20,19 +24,10 @@ and one player pool:
 Run the tool with `python -m draftsim`, and any simulator on its own with
 `python -m draftsim.combined_draft` and so on.
 
-Projections ship with the package, under DATA. The ADP board does not: it
-moves daily, so adp.py scrapes it from nfc.shgn.com over a window you choose
-and caches it. Simulators write their output to the current working
-directory, not in here.
+No data ships with the package. Both inputs move -- the market daily, the
+projections whenever a source updates -- so both are fetched on demand and
+cached under DRAFTSIM_CACHE, or ~/.cache/draftsim. Simulators write their
+output to the current working directory.
 """
 
-from pathlib import Path
-
-__version__ = "1.0.0"
-
-# The ADP table and projections, installed alongside the code so a board loads
-# the same way wherever the package is run from.
-DATA = Path(__file__).resolve().parent / "data"
-
-PROJECTIONS = DATA / "projections_robust.csv"
-PROJECTION_STATS = DATA / "projections_stats.csv"
+__version__ = "2.0.0"

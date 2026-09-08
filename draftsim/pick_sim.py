@@ -32,7 +32,7 @@ final roster can field -- 1 QB, 2 RB, 3 WR, 1 TE, 1 FLEX, 1 DST, 1 K at the
 default league, bench excluded.
 
 Those points are the projection as published, one fixed number per player:
-the `points` column of projections_robust.csv, not a sampled season and not
+the robust `points` ffanalytics reconciles, not a sampled season and not
 the components re-scored. Sampling belongs to the board and stops there. It
 decides who is *available* when your pick comes back, which is a genuine
 draft unknown worth simulating; carrying it into the report would instead
@@ -74,7 +74,7 @@ PickState = namedtuple("PickState", "gone counts roster order user_team")
 _ENGINE = None  # one per worker process, built once
 
 
-def _init_worker(lg, matched_only, w_lo, w_hi, adp_path):
+def _init_worker(lg, matched_only, w_lo, w_hi, adp_path, source):
     """Give this worker its own Engine.
 
     The board costs a second and a half to load and never changes, so it is
@@ -86,7 +86,7 @@ def _init_worker(lg, matched_only, w_lo, w_hi, adp_path):
     from . import combined_draft  # worker-only; keeps the import out of the
 
     _ENGINE = Engine(
-        combined_draft.Board(lg, matched_only, adp_path),  # parent's path
+        combined_draft.Board(lg, matched_only, adp_path, source),
         lg,
         w_lo,
         w_hi,
@@ -105,12 +105,21 @@ class Parallel:
     cost; every one after it is warm.
     """
 
-    def __init__(self, lg, matched_only, w_lo, w_hi, workers=0, adp_path=None):
+    def __init__(
+        self,
+        lg,
+        matched_only,
+        w_lo,
+        w_hi,
+        workers=0,
+        adp_path=None,
+        source=None,
+    ):
         self.workers = workers or os.cpu_count() or 1
         self._pool = ProcessPoolExecutor(
             max_workers=self.workers,
             initializer=_init_worker,
-            initargs=(lg, matched_only, w_lo, w_hi, adp_path),
+            initargs=(lg, matched_only, w_lo, w_hi, adp_path, source),
         )
 
     def map(self, tasks):

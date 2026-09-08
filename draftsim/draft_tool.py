@@ -76,6 +76,8 @@ from .adp import add_adp_args
 from .combined_draft import W_HI, W_LO
 from .league import DEF, DRAFTABLE, K, add_league_args, league_from_args
 from .pick_sim import N_POS, N_SIMS, best_available
+from .projections import add_projection_args
+from .projections import from_args as projections_from_args
 
 MY_WEIGHT = 0.6  # the VOR/ADP blend the board is shown to you in
 SEED = 960122  # fixed, so the same flags give the same draft
@@ -709,11 +711,13 @@ def run(draft, n_sims, rng, auto=False, mock=True, pool=None):
 
 
 def main():
-    ap = add_adp_args(
-        add_league_args(
-            argparse.ArgumentParser(
-                description=__doc__,
-                formatter_class=argparse.RawDescriptionHelpFormatter,
+    ap = add_projection_args(
+        add_adp_args(
+            add_league_args(
+                argparse.ArgumentParser(
+                    description=__doc__,
+                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                )
             )
         )
     )
@@ -782,8 +786,9 @@ def main():
     # scraped once here and handed down, so the workers below read the
     # board this process pulled rather than each pulling its own
     adp_path = adp.path_from_args(a)
+    source = projections_from_args(a, adp_path)
     print("loading the board...", end=" ", flush=True)
-    board = combined_draft.Board(lg, a.matched_only, adp_path)
+    board = combined_draft.Board(lg, a.matched_only, adp_path, source)
     eng = pick_sim.Engine(board, lg, a.vor_weight_lo, a.vor_weight_hi)
     print("%d players" % eng.n)
     for key, win, lose in board.pid_clashes:
@@ -823,6 +828,7 @@ def main():
             a.vor_weight_hi,
             a.workers,
             adp_path,
+            source,
         )
         print("simulating on %d worker processes" % pool.workers)
     try:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "draftsim"
-version = "1.0.0"
+version = "2.0.0"
 description = "Fantasy football draft simulation, and a tool to draft against it"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,15 +14,15 @@ dependencies = [
     "scipy>=1.10",
     "pyarrow>=14",
 ]
+# Projections come out of the ffanalytics R package, so R and ffanalytics have
+# to be installed too -- neither is a Python dependency and pip cannot get
+# them. See the README; draftsim.projections says so plainly if R is missing.
 
 [project.scripts]
 draftsim = "draftsim.draft_tool:main"
 
 [tool.setuptools]
 packages = ["draftsim"]
-
-[tool.setuptools.package-data]
-draftsim = ["data/*.tsv", "data/*.csv"]
 
 [tool.ruff]
 line-length = 79
