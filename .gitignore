@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# ADP is scraped from nfc.shgn.com at run time and cached outside the tree
+# (~/.cache/draftsim), so no copy of the market is carried here
+ADP.tsv
+
+# the ffanalytics R pipeline's working directory. The two projection files
+# draftsim needs are copied into draftsim/data and committed; the rest of it
+# -- raw scrapes, .rds files, intermediate merges -- is not part of the tool
+ffanalytics/
+
+# everything the simulators write, all of it reproducible from a seed
+*.parquet
+draft_player_summary.csv
+vor_draft_summary.csv
+combined_draft_summary.csv
+combined_draft.csv
+combined_ranks.csv
+
+# fitting and research output
+vor.csv
+skewnorm_params.csv
+weibull_params.csv
+availability*.csv
+excluded_under20picks.tsv
+single_pick_players.tsv
+*.png
