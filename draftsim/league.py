@@ -26,12 +26,21 @@ count, roster size, starting lineup, flex -- is shared.
 
 The rules and draft-order policy that follow from a league:
     bench is QB/RB/WR/TE only -- never a second DST or K
-    QB and TE cap at starters + 1; exactly 1 DST and 1 K, and the K is
-      always a team's final pick
+    QB and TE cap at starters + 1; exactly 1 DST and 1 K, and a K only in a
+      team's last LATE_ROUNDS picks
     at most 1 bench player before the starting RB and WR slots are full
     no bench QB or TE at all until those RB/WR starters are full
     QB, TE and DST starters may be deferred as long as the roster can still
       be completed, so a team may fill bench spots ahead of them
+
+Legality is one question and what a team would actually draft is another, so
+they are two methods. legal() is the roster rule: could this roster hold that
+player and still be completed. on_board() is the board: of the picks that are
+legal, the ones a team drafting off a ranked board should ever be offered. A
+second quarterback is the case that separates them -- the caps allow one, and
+no team should spend a pick on one, so he is legal and off the board. The
+draft tool prices him as an option anyway, because a drafter may want the
+backup his rivals will not take, and holds only your own picks to legal().
 """
 
 from functools import lru_cache
@@ -47,6 +56,10 @@ BASELINE_OVERRIDE = {K: 3, DEF: 3}
 FLEX_POS = ("RB", "WR", "TE")
 DRAFTABLE = ("QB", "RB", "WR", "TE", DEF, K)
 MAX_BENCH_BEFORE_RBWR = 1  # bench picks allowed before RB/WR starters fill
+# A team's closing picks, where the kicker and the defense belong: both are
+# streamed, both are on the board only here, and a kicker is not legal at all
+# until a roster is this close to done.
+LATE_ROUNDS = 3
 
 
 class League:
@@ -136,9 +149,10 @@ class League:
         counts = dict(zip(DRAFTABLE, state, strict=True))
         if counts[pos] + 1 > self.caps.get(pos, self.roster):
             return False
-        # Kickers go last: a K is only ever a team's final pick, and conversely
-        # the final pick must be a K because the reserve below leaves no room.
-        if pos == K and taken + 1 < self.roster:
+        # Kickers go late: a K is only ever one of a team's last LATE_ROUNDS
+        # picks, which is where the defense belongs too, and the reserve below
+        # makes sure one of those picks is still spent on him.
+        if pos == K and taken < self.roster - LATE_ROUNDS:
             return False
 
         c = dict(counts)
@@ -168,6 +182,26 @@ class League:
             if nb > self.bench_count(counts) and pos in ("QB", "TE"):
                 return False  # this pick would be a bench QB/TE
         return True
+
+    def on_board(self, counts, pos, taken):
+        """Would a team drafting off a ranked board take this position?
+
+        Legality, less the picks a board should never offer. There is one:
+        a second quarterback. The caps allow him, so a roster carrying one
+        is legal, but a team that has its starter has nothing to gain by
+        spending a pick on another -- the backup never enters the lineup,
+        and on the board he sits above the running backs and receivers who
+        would. So once a team's QB starters are filled, quarterbacks come
+        off that team's board and it drafts past them.
+
+        The draft tool still prices the best available QB as one of your
+        options, since a drafter may want the backup precisely because no
+        rival will take him. Your own picks are checked against legal(),
+        not this.
+        """
+        if pos == "QB" and counts["QB"] >= self.starters["QB"]:
+            return False
+        return self.legal(counts, pos, taken)
 
     def bench_count(self, c):
         """Players on a roster that fill no starting slot.

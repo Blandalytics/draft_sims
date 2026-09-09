@@ -244,7 +244,7 @@ def run_draft(entries, orders, lg):
         head[team] = h
         for j in range(h, n):
             i = board[j]
-            if gone[i] or not lg.legal(c, entries[i]["pos"], t):
+            if gone[i] or not lg.on_board(c, entries[i]["pos"], t):
                 continue
             gone[i] = 1
             c[entries[i]["pos"]] += 1

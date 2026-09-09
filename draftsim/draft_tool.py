@@ -23,11 +23,25 @@ and leave every option finishing the same team. In the twelfth round ten
 options spread 1.1 points and 33 VOR. A star marks the column that ordered
 the table, and the spread, the gap and best% are all read off it.
 
+That VOR is priced against the slot a player is really competing for. Every
+player has two, his own position's replacement and the flex line, and a
+roster takes the first for as long as it still owes a starter at that
+position and the second for everyone it adds there afterwards -- so your
+third running back is measured against the flex line rather than against
+RB24. pick_sim.Engine.roster_vor has the arithmetic.
+
 You always get the full count: a position you cannot legally add, a capped QB
-or a kicker before the final pick, buys another player off the board rather
-than costing you an option.
+or a kicker before the closing rounds, buys another player off the board
+rather than costing you an option.
 Kickers and defenses are held back until the last three rounds, where they
-belong; before that the board fills past them, and `p <name>` overrides it.
+belong; there both are on the board, a kicker being legal for a team's last
+three picks. Before that the board fills past them, and `p <name>` overrides
+it.
+
+No team drafts a backup quarterback: once its starter is filled, quarterbacks
+come off that team's board, and that includes your own team in the
+simulations. You are still shown the best one available every round, because
+a backup nobody else will take is a pick only you can decide is worth making.
 
 Every option is another 500 finishes, so --options is what a decision costs.
 Ten of them is a fifth of a second on a warm pool; there is room to raise it.
@@ -86,7 +100,14 @@ import numpy as np
 from . import adp, combined_draft, pick_sim
 from .adp import add_adp_args
 from .combined_draft import W_HI, W_LO
-from .league import DEF, DRAFTABLE, K, add_league_args, league_from_args
+from .league import (
+    DEF,
+    DRAFTABLE,
+    LATE_ROUNDS,
+    K,
+    add_league_args,
+    league_from_args,
+)
 from .pick_sim import N_POS, N_SIMS, best_available
 from .projections import add_projection_args
 from .projections import from_args as projections_from_args
@@ -94,7 +115,6 @@ from .projections import from_args as projections_from_args
 MY_WEIGHT = 0.6  # the VOR/ADP blend the board is shown to you in
 SEED = 960122  # fixed, so the same flags give the same draft
 N_OPTIONS = 10  # options priced per pick, however they break down
-LATE_ROUNDS = 3  # rounds at the end where K and DST are offered
 TOP_POS = ("QB", "RB", "WR", "TE")
 
 
@@ -191,7 +211,7 @@ class Draft:
             self.heads[team],
             self.scores[team],
             self.gone,
-            self.eng.legal_positions(self.counts[team]),
+            self.eng.board_positions(self.counts[team]),
         )
         if i < 0:
             raise RuntimeError("no legal player at pick %d" % (self.ptr + 1))
@@ -224,12 +244,19 @@ class Draft:
         players not already named, which late in a draft is where a DST or K
         turns up.
 
+        The two halves ask different questions. A leader is offered if you
+        could legally take him, so the best quarterback is priced every round
+        even once you have your starter -- the room will not take a backup,
+        which is exactly why you might. The fill is the board, and the board
+        drops him: League.on_board, the same one your rivals draft off, so
+        what comes up from the fill is what a team would actually take.
+
         A position the roster cannot legally add is dropped rather than shown
         as an option you are not allowed to take, and the board covers for it,
         so the count holds however the four break down. That matters most in
-        the rounds where it bites: with the QB and TE caps reached and a
-        kicker only legal at the final pick, all four can be gone at once, and
-        that many board players is exactly the choice you actually have.
+        the rounds where it bites: with the QB and TE caps reached, all four
+        can be gone at once, and that many board players is exactly the choice
+        you actually have.
 
         The four leaders are collected in board order rather than in QB, RB,
         WR, TE order, which only shows when --options is set below four: what
@@ -241,18 +268,21 @@ class Draft:
         one. Both are priced off a pinned baseline -- the third best at the
         position, since they are streamed and a starters x teams baseline
         would inflate them -- while a WR is priced off the 36th WR, three
-        starters times twelve teams. No team may take a kicker before the
-        final pick, so the best one available holds +10 VOR the whole draft,
-        while the best WR left crosses below that around the ninth round and
-        keeps going: WR43 and -15 by the tenth, WR52 and -28 by the
-        fourteenth. So K and DST reach the top of the board on merit, and
-        offering them there would spend options on a pick nobody makes. The
-        board fills past them instead, and `p <name>` still takes one.
+        starters times twelve teams. So the best kicker available holds +10
+        VOR the whole draft, while the best WR left crosses below that around
+        the ninth round and keeps going: WR43 and -15 by the tenth, WR52 and
+        -28 by the fourteenth. K and DST would therefore reach the top of the
+        board on merit, and offering them there would spend options on a pick
+        nobody makes; `p <name>` still takes one. In those closing rounds
+        both are on the board together, a kicker being legal for a team's
+        last LATE_ROUNDS picks rather than only its final one.
         """
+        counts = self.counts[self.user_team]
         board = self.my_board()
-        ok = self.eng.legal_positions(self.counts[self.user_team])
-        out = self._position_leaders(board, ok)[: self.n_options]
-        self._fill_from_board(out, board, ok)
+        out = self._position_leaders(board, self.eng.legal_positions(counts))[
+            : self.n_options
+        ]
+        self._fill_from_board(out, board, self.eng.board_positions(counts))
         return out, board
 
     def _position_leaders(self, board, ok):
@@ -441,7 +471,9 @@ def show_options(draft, opts, res, measure=PTS):
         print(
             "\n  * ranked on the roster's total simulated VOR: none of"
             " these can reach your\n    starting lineup, so team pts is"
-            " the same team whichever you take"
+            " the same team whichever you take. Your\n    starters are"
+            " full at each of their positions, so an RB, WR or TE here"
+            "\n    is priced against the flex line rather than his own"
         )
 
 

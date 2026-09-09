@@ -1,9 +1,11 @@
-"""Projections, pulled from the ffanalytics R package rather than kept as CSVs.
+"""Projections: the projection sites scraped and reconciled, not kept as CSVs.
 
-ffanalytics scrapes half a dozen projection sites and reconciles them, and it
-is an R package. So this drives it directly: an R program, held below as a
-string, is handed to Rscript, and hands back the two tables draftsim needs on
-its standard output. Nothing is written to a CSV on the way through.
+The numbers are ffanalytics', and they used to be fetched by driving the
+ffanalytics R package itself -- an R program handed to Rscript, handing two
+tables back on its standard output. They are now built here: source_scrapes
+does what its `scrape_data()` does and calc_projections what its
+`projections_table()` does, so nothing in this project needs R installed.
+What comes back is unchanged:
 
     points   one row per player -- projected points, their spread across the
              sources, VOR against the baselines, rank, tier, and the name,
@@ -13,30 +15,29 @@ its standard output. Nothing is written to a CSV on the way through.
              from to give every simulated draft its own season
 
 Both come out of the same call, `projections_table()`, the second with
-`return_raw_stats = TRUE`. That is worth knowing because it is not obvious:
-the stat-level table with its per-source standard deviations is not a separate
+`raw_stats=True`. That is worth knowing because it is not obvious: the
+stat-level table with its per-source standard deviations is not a separate
 function, it is the same aggregation returned before it is scored.
 
 Scoring comes from scoring.py -- Yahoo's default, 0.5 PPR, unless the league
-says otherwise -- and is written into the R program so that the run carries
-its own rules rather than depending on a saved object. The same object scores
-the sampled stats on the Python side, in vor_draft_sim, which is the point of
-it being one object: the rules also decide which stat columns come back at
-all, since a category worth zero points is never aggregated.
+says otherwise -- and is handed to the aggregation, so the run carries its own
+rules rather than depending on a saved object. The same object scores the
+sampled stats in vor_draft_sim, which is the point of it being one object: the
+rules also decide which stat columns come back at all, since a category worth
+zero points is never aggregated.
 
-A scrape takes about two minutes and hits six sites per position, so the
+A scrape takes a few minutes and hits up to nine sites per position, so the
 result is cached under DRAFTSIM_CACHE (or ~/.cache/draftsim) as JSON, keyed by
 season, week and the scoring, and is looked for in this order:
 
     the local cache, if this machine has already built or fetched it
     the copy published at PUBLISHED, which is that same JSON committed to the
-      project, and is what lets the tool run where R is not installed -- a
-      borrowed laptop, a Colab notebook -- with no R, no ffanalytics and no
-      two-minute wait. Only the default scoring is published
-    a fresh scrape out of R
-    failing all of that, on a scoring nobody has published and a machine with
-      no R: the published component stats, scored here under the league's own
-      rules. See rescore(), which says what that costs
+      project: no wait at all, and the sites need not be reachable. Only the
+      default scoring is published
+    a fresh scrape
+    failing all of that -- a scoring nobody has published, and sites that
+      cannot be reached: the published component stats, scored here under the
+      league's own rules. See rescore(), which says what that costs
 
 `--refresh-projections` skips both caches and insists on the scrape, which is
 the only way to get numbers newer than what is published. Whatever arrives is
@@ -53,39 +54,71 @@ without a market, exactly as combined_draft already expects.
 """
 
 import argparse
+import contextlib
 import csv
 import io
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import unicodedata
 import urllib.request
 from collections import namedtuple
 from datetime import date
-from pathlib import Path
 
+from . import calc_projections, source_scrapes
 from .adp import add_adp_args, cache_dir
 from .adp import path_from_args as adp_path_from_args
 from .scoring import Scoring, add_scoring_args
 from .scoring import from_args as scoring_from_args
 
 POSITIONS = ("QB", "RB", "WR", "TE", "K", "DST")
-TIMEOUT = 900  # a scrape is ~2 minutes; this is a wide safety margin
 SEASON_STARTS = 3  # from March, "this season" means this calendar year
+TIMEOUT = 60  # fetching the published cache; the scrapers keep their own
+
+# The sites worth asking. ffanalytics lists three more -- NFL.com and
+# NumberFire, which both now redirect away from the pages it reads, and
+# FantasyData, which is behind a paywall -- and asking them costs a request
+# per position for nothing. NumberFire's projections are FanDuel's now.
+#
+# Not all nine are asked every time: FleaFlicker and FanDuel publish the
+# coming week rather than the season, so a draft board is built from the
+# other seven, and a weekly one leaves out WalterFootball and RTSports
+# instead. source_scrapes.AVAILABLE is where that is decided.
+SOURCES = (
+    "cbs",
+    "espn",
+    "fanduel",
+    "fantasypros",
+    "fantasysharks",
+    "fftoday",
+    "fleaflicker",
+    "rtsports",
+    "walterfootball",
+)
+
+# The ranks VOR is measured from. These are the baselines this project has
+# always passed ffanalytics, not its defaults, and they are not the
+# replacement levels draftsim drafts against either -- league.py derives
+# those from the league's own shape. They set the `rank` column's ordering.
+BASELINE = {
+    "QB": 10,
+    "RB": 20,
+    "WR": 20,
+    "TE": 10,
+    "K": 3,
+    "DST": 3,
+    "DL": 10,
+    "LB": 10,
+    "DB": 10,
+}
 
 # Where this project publishes the cache it built. Same JSON the local cache
-# holds, under the same filename, so a machine with no R -- a borrowed
-# laptop, a Colab notebook -- has projections to draft on without one.
+# holds, under the same filename, so a borrowed laptop or a Colab notebook
+# has projections to draft on without waiting three minutes for them.
 PUBLISHED = (
     "https://raw.githubusercontent.com/Blandalytics/draft_sims/main/data/"
 )
-POINTS_MARK = "##POINTS"
-STATS_MARK = "##STATS"
-
 # how the ADP board spells the two positions that are not skill positions,
 # and the columns of the board itself, which is read positionally
 ADP_POS = {"DST": "TDSP", "K": "TK"}
@@ -111,53 +144,6 @@ CACHE_NAME = re.compile(r"^projections_(\d+)_w(\d+)(?:_([0-9a-f]{8}))?$")
 
 Projections = namedtuple("Projections", "points stats season week scoring")
 
-# The R program, in two halves with the league's scoring rules written in
-# between: scoring.Scoring.r_block() renders that middle. The VOR baselines
-# below are ffanalytics' own and are not the replacement levels draftsim
-# drafts against -- league.py derives those from the league's shape -- so
-# they are left where they are.
-R_HEAD = r"""
-suppressMessages(library(ffanalytics))
-
-args   <- commandArgs(trailingOnly = TRUE)
-season <- as.integer(args[1])
-week   <- as.integer(args[2])
-
-"""
-R_TAIL = r"""
-baseline <- c(QB = 10, RB = 20, WR = 20, TE = 10, K = 3, DST = 3,
-              DL = 10, LB = 10, DB = 10)
-
-# scrape_data narrates itself on stdout, which is where the tables have to go,
-# so its chatter is caught and dropped. Anything it raises as a message still
-# reaches stderr, where the caller reports it.
-noise <- textConnection("scrape_noise", "w", local = TRUE)
-sink(noise, type = "output")
-raw <- scrape_data(pos = c("QB", "RB", "WR", "TE", "K", "DST"),
-                   season = season, week = week)
-sink(type = "output")
-close(noise)
-
-points <- add_player_info(projections_table(
-  raw, scoring_rules = scoring, vor_baseline = baseline))
-stats <- add_player_info(projections_table(
-  raw, scoring_rules = scoring, vor_baseline = baseline,
-  return_raw_stats = TRUE))
-
-out <- function(mark, df) {
-  cat(mark, "\n", sep = "")
-  write.table(df, stdout(), sep = "\t", row.names = FALSE, quote = FALSE,
-              na = "")
-}
-out("##POINTS", points)
-out("##STATS", stats)
-"""
-
-
-def r_program(scoring):
-    """The R program, scored by this league's rules."""
-    return R_HEAD + scoring.r_block() + R_TAIL
-
 
 def season_now(today=None):
     """The season ffanalytics would call current."""
@@ -165,82 +151,61 @@ def season_now(today=None):
     return d.year if d.month >= SEASON_STARTS else d.year - 1
 
 
-def find_rscript():
-    """Rscript, from DRAFTSIM_RSCRIPT, the path, or a Windows install."""
-    env = os.environ.get("DRAFTSIM_RSCRIPT")
-    if env:
-        return env
-    found = shutil.which("Rscript")
-    if found:
-        return found
-    installs = sorted(
-        Path("C:/Program Files/R").glob("R-*/bin/Rscript.exe"), reverse=True
-    )
-    return str(installs[0]) if installs else None
+def scrape(season, week=0, scoring=None, quiet=False, refresh=False):
+    """Scrape the sites and reconcile them into the two tables.
 
+    This is the work the R program used to do: one call to ffanalytics'
+    `scrape_data()` and two to its `projections_table()`, which are now
+    source_scrapes.scrape and calc_projections.projections_table. The
+    scrapers narrate themselves page by page, which is worth watching from a
+    terminal and worth swallowing when the draft tool is drawing over it, so
+    `quiet` keeps their chatter and prints only the line that matters.
 
-def rscript():
-    """find_rscript(), or the explanation of why there is nothing to run."""
-    found = find_rscript()
-    if found is None:
-        raise SystemExit(
-            "Rscript not found. draftsim reads its projections out of the "
-            "ffanalytics R package, so R has to be installed and on the "
-            "path, or DRAFTSIM_RSCRIPT set to the Rscript binary."
-        )
-    return found
-
-
-def scrape(season, week=0, scoring=None, timeout=TIMEOUT, quiet=False):
-    """Run the R program and read the two tables off its output."""
+    `refresh` reaches the scrapers too: they keep an hour of their own, and
+    a caller who asked for fresher numbers than the projections cache holds
+    did not mean fresher by up to an hour.
+    """
+    scoring = scoring or Scoring()
     if not quiet:
         print(
-            "projections: scraping %d week %d via ffanalytics, ~2 minutes..."
+            "projections: scraping %d week %d, a few minutes..."
             % (season, week),
-            end=" ",
             flush=True,
         )
-    # The program goes to a temporary file rather than `Rscript -e`: a
-    # multi-line program handed to -e crashes the interpreter outright on
-    # Windows. The file is the R program held above, written out and removed
-    # again, not an artifact of the run.
-    with tempfile.TemporaryDirectory(prefix="draftsim-r-") as tmp:
-        prog = Path(tmp) / "projections.R"
-        prog.write_text(r_program(scoring or Scoring()), encoding="utf-8")
-        proc = subprocess.run(
-            [rscript(), str(prog), str(season), str(week)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+    hush = (
+        contextlib.redirect_stdout(io.StringIO())
+        if quiet
+        else contextlib.nullcontext()
+    )
+    with hush:
+        scraped = source_scrapes.scrape(
+            SOURCES, POSITIONS, season, week, refresh
         )
-    if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
-        raise RuntimeError(
-            "ffanalytics failed (exit %d):\n%s" % (proc.returncode, tail)
-        )
-    points, stats = split(proc.stdout)
+        points = _reconcile(scraped, scoring, season, week, False)
+        stats = _reconcile(scraped, scoring, season, week, True)
     if not points or not stats:
-        raise RuntimeError("ffanalytics returned no projections")
+        raise RuntimeError(
+            "no projections came back: every site failed or had nothing"
+        )
     if not quiet:
-        print("%d players" % len(points))
+        print(
+            "projections: %d players, %d stat rows"
+            % (len(points), len(stats))
+        )
     return points, stats
 
 
-def split(text):
-    """The two marked TSV sections of the R program's output."""
-    a = text.find(POINTS_MARK)
-    b = text.find(STATS_MARK, a + 1)
-    if a < 0 or b < 0:
-        raise RuntimeError("ffanalytics output carried no table markers")
-    return (
-        _tsv(text[a + len(POINTS_MARK) : b]),
-        _tsv(text[b + len(STATS_MARK) :]),
-    )
-
-
-def _tsv(chunk):
-    return list(
-        csv.DictReader(io.StringIO(chunk.strip("\r\n")), delimiter="\t")
+def _reconcile(scraped, scoring, season, week, raw_stats):
+    """One of the two tables, with the players' names and teams attached."""
+    return calc_projections.add_player_info(
+        calc_projections.projections_table(
+            scraped,
+            scoring,
+            season,
+            week,
+            vor_baseline=BASELINE,
+            raw_stats=raw_stats,
+        )
     )
 
 
@@ -344,10 +309,10 @@ def published_url(season, week):
 def fetch_published(season, week, quiet=False):
     """The cache this project publishes, or None if it is not there.
 
-    This is what makes the tool run somewhere R is not, which is most
-    borrowed machines and every Colab notebook: the numbers a scrape would
-    have produced, already scraped, fetched over HTTP and then kept locally
-    like any other cache.
+    The numbers a scrape would have produced, already scraped: fetched over
+    HTTP and then kept locally like any other cache. It costs one request
+    rather than three minutes and nine sites, which is why it is tried
+    before the scrape rather than after it.
     """
     url = published_url(season, week)
     try:
@@ -384,11 +349,10 @@ def rescore(stats, scoring):
     """A points table scored here, off the component stats.
 
     The way to score a board by rules nobody has published is to scrape it
-    under those rules, and that is what happens wherever R is installed.
-    This is the other case -- custom scoring on a machine with no R, which
-    is any Colab notebook -- and it works because the component stats are
-    scoring's raw material: what a player is projected to do does not
-    depend on what the league pays for it.
+    under those rules, and that is what normally happens. This is the other
+    case -- custom scoring with the sites unreachable -- and it works
+    because the component stats are scoring's raw material: what a player is
+    projected to do does not depend on what the league pays for it.
 
     What it costs is the reconciliation. ffanalytics returns each avg_type
     twice over, once as reconciled stats and once as reconciled points, and
@@ -398,8 +362,8 @@ def rescore(stats, scoring):
     reconciles each source's points rather than each source's stats, and
     the difference reaches 18 points on a quarterback. So a rescored
     `robust` row is the robust stats scored, not the robust points --
-    a defensible number, and not the same number. --refresh-projections on
-    a machine with R gives the scrape instead.
+    a defensible number, and not the same number. --refresh-projections
+    gives the scrape instead, once the sites can be reached.
 
     `sd_pts` follows the components too, treating them as independent,
     which is what load_board would do to it anyway.
@@ -444,14 +408,13 @@ def _rescored(season, week, quiet, scoring):
     if missing:
         print(
             "projections: no source projects %s, so scoring it changes "
-            "nothing here. Install R and --refresh-projections to find "
-            "out whether ffanalytics can get it" % ", ".join(missing),
+            "nothing here" % ", ".join(missing),
             file=sys.stderr,
         )
     if not quiet:
         print(
-            "projections: no R here, so scoring the published component "
-            "stats under your rules -- see projections.rescore()"
+            "projections: no scrape to be had, so scoring the published "
+            "component stats under your rules -- see projections.rescore()"
         )
     return {
         "season": season,
@@ -463,10 +426,10 @@ def _rescored(season, week, quiet, scoring):
     }
 
 
-def _scraped(season, week, quiet, scoring):
+def _scraped(season, week, quiet, scoring, refresh=False):
     """A fresh scrape, or None with the reason on stderr."""
     try:
-        points, stats = scrape(season, week, scoring, quiet=quiet)
+        points, stats = scrape(season, week, scoring, quiet, refresh)
     except Exception as exc:
         print("projections: %s" % exc, file=sys.stderr)
         return None
@@ -489,27 +452,32 @@ def _stale(scoring):
 
 
 def _build(season, week, path, quiet, scoring, refresh=False):
-    """Build the projections, by whatever means this machine has.
+    """Build the projections, by whatever means the network allows.
 
-    R if it is installed, and it is the only way to a board these rules
-    have never been applied to. Failing that, the published stats scored
-    here, which the default scoring has no use for -- what is published is
-    already scored that way, better. Failing that, any cache at all.
+    A scrape, which is the only way to a board these rules have never been
+    applied to. Failing that -- the sites unreachable, or one of them
+    changed under us -- the published component stats scored here, which the
+    default scoring has no use for, since what is published is already
+    scored that way and scored better. Failing that, any cache at all.
+
+    The rescored board is deliberately not written to the cache: it is a
+    compromise made because a scrape did not happen, and it should not
+    outlive the run that needed it.
     """
-    if refresh:
-        rscript()  # insisting on a scrape, so say plainly if there is none
-    blob = _scraped(season, week, quiet, scoring) if find_rscript() else None
-    if blob is None and not scoring.is_default():
-        blob = _rescored(season, week, quiet, scoring)
+    blob = _scraped(season, week, quiet, scoring, refresh)
     if blob is not None:
         _write_cache(blob, path)
         return blob
+    if not scoring.is_default():
+        blob = _rescored(season, week, quiet, scoring)
+        if blob is not None:
+            return blob
     blob = _stale(scoring)
     if blob is None:
         raise SystemExit(
             "no projections for %d week %d under %s: nothing cached, "
-            "nothing published, and no R to build them with (see the "
-            "README)." % (season, week, scoring.summary())
+            "nothing published, and the sites could not be reached "
+            "(see the README)." % (season, week, scoring.summary())
         )
     return blob
 
@@ -517,12 +485,7 @@ def _build(season, week, path, quiet, scoring, refresh=False):
 def _cached(path, season, week, scoring, quiet):
     """The local cache, or the published copy, or None."""
     if path.exists():
-        blob = json.loads(path.read_text(encoding="utf-8"))
-        # a rescored cache is the no-R compromise, not the real thing: a
-        # machine that has since found R should scrape rather than keep it
-        if not (blob.get("rescored") and find_rscript()):
-            return blob
-        return None
+        return json.loads(path.read_text(encoding="utf-8"))
     if not scoring.is_default():
         return None  # only the default rules are published
     blob = fetch_published(season, week, quiet)
@@ -543,9 +506,9 @@ def load(
     them.
 
     In order: the local cache, then the copy this project publishes, then a
-    fresh scrape out of R. The middle step is the one that matters away from
-    a machine with ffanalytics on it -- and it is cached locally on arrival,
-    so it is fetched once however many worker processes want it.
+    fresh scrape. The middle step is what makes the tool open at once on a
+    machine that has never run it -- and it is cached locally on arrival, so
+    it is fetched once however many worker processes want it.
 
     `scoring` is the league's, and everything here is keyed on it: nothing
     but the default rules is published, so a league with its own scoring
@@ -570,7 +533,8 @@ def load(
 def add_projection_args(ap):
     g = ap.add_argument_group(
         "projections",
-        "pulled from the ffanalytics R package, cached under %s" % cache_dir(),
+        "scraped and reconciled as ffanalytics does, cached under %s"
+        % cache_dir(),
     )
     g.add_argument(
         "--projections-season",

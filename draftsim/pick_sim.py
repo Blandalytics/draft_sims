@@ -27,9 +27,12 @@ common random numbers -- so a difference between two options is measured on
 identical futures and reflects the choice rather than the sampling. That is
 what makes a few points off 500 simulations mean anything.
 
-The number reported is the projected points of the best starting lineup the
-final roster can field -- 1 QB, 2 RB, 3 WR, 1 TE, 1 FLEX, 1 DST, 1 K at the
-default league, bench excluded.
+Two numbers come back per simulated finish. The first is the projected points
+of the best starting lineup the final roster can field -- 1 QB, 2 RB, 3 WR,
+1 TE, 1 FLEX, 1 DST, 1 K at the default league, bench excluded. The second is
+the whole roster's value over replacement, all fifteen of them, which is the
+only one of the two that can still tell bench picks apart: see roster_vor,
+and the two baselines each player is priced against there.
 
 Those points are the projection as published, one fixed number per player:
 the robust `points` ffanalytics reconciles, not a sampled season and not
@@ -206,6 +209,7 @@ class Engine:
         self.starts = [lg.all_starters.get(p, 0) for p in DRAFTABLE]
         self.flex_codes = [POS_CODE[p] for p in FLEX_POS]
         self._legal_cached = lru_cache(maxsize=None)(self._legal_uncached)
+        self._board_cached = lru_cache(maxsize=None)(self._board_uncached)
 
     def _static_ranks(self):
         """The unsampled board: one VOR rank, one ADP rank, drawn from nothing.
@@ -236,14 +240,31 @@ class Engine:
         vor_rank = np.empty(b.n_vor, dtype=np.float64)
         vor_rank[np.argsort(-vor, kind="stable")] = np.arange(1, b.n_vor + 1)
 
-        # The VOR itself, not just its rank: what a player is worth over the
-        # replacement at his position, for every player in the pool. A player
-        # with no projection scores nothing, so his VOR is the whole of that
-        # replacement level negated -- a real number, and a bad one, which is
-        # what he is worth. roster_vor sums these.
-        self.vor = [
-            self.proj[i] - repl[e["pos"]] for i, e in enumerate(self.entries)
-        ]
+        # The VOR itself, not just its rank, in the two components a roster
+        # is priced on -- see roster_vor, which decides which of them a
+        # player gets:
+        #
+        #   vor_start  points over the replacement at his own position: the
+        #              (starters x teams)th best there, so RB24 and WR36 at
+        #              the default league
+        #   vor_flex   points over the flex line: the (flex x teams)th best
+        #              of everyone at a flex position who is not starting
+        #              calibre there, which is one line for RB, WR and TE
+        #              alike
+        #
+        # A position that never reaches the flex -- QB, K, DST -- has one
+        # baseline and both components are it, so the pivot below needs no
+        # special case for them. A player with no projection scores nothing,
+        # so his VOR is that replacement level negated: a real number, and a
+        # bad one, which is what he is worth.
+        flex = repl["FLEX"]
+        self.vor_start, self.vor_flex = [], []
+        for i, e in enumerate(self.entries):
+            pos = e["pos"]
+            self.vor_start.append(self.proj[i] - repl[pos])
+            self.vor_flex.append(
+                self.proj[i] - (flex if pos in FLEX_POS else repl[pos])
+            )
 
         self.rank_vor = np.where(
             b.vor_row >= 0, vor_rank[b.vor_row], b.n_vor + 1.0
@@ -262,8 +283,23 @@ class Engine:
         counts = dict(zip(DRAFTABLE, state, strict=True))
         return tuple(self.lg.legal(counts, p, sum(state)) for p in DRAFTABLE)
 
+    def _board_uncached(self, state):
+        """Which positions a roster in `state` would actually draft.
+
+        League.on_board rather than League.legal: the two differ over the
+        backup quarterback, whom no team drafting off a board should take.
+        Cached the same way and off the same key.
+        """
+        counts = dict(zip(DRAFTABLE, state, strict=True))
+        return tuple(
+            self.lg.on_board(counts, p, sum(state)) for p in DRAFTABLE
+        )
+
     def legal_positions(self, counts):
         return self._legal_cached(tuple(counts))
+
+    def board_positions(self, counts):
+        return self._board_cached(tuple(counts))
 
     def lineup_points(self, roster):
         """Projected points of the best lineup this roster can start."""
@@ -307,8 +343,31 @@ class Engine:
         all fifteen, so a better bench player is worth more than a worse one,
         and the pick's effect on who is left for the rest of the draft shows
         up too.
+
+        Each player is priced on one of the two components, and which one
+        depends on the roster around him: a position is worth vor_start
+        while the team still owes a starter there, and vor_flex for every
+        player it takes at that position afterwards. So the third running
+        back on a roster is not credited with replacing RB24 -- he is
+        measured against the flex line, which is the slot he is actually
+        competing for, and at the default league that is worth +35 to him.
+        A tight end the other way: the second one loses 9, TE13 being an
+        easier bar than the flex line.
+
+        Which players at a position take the starting share does not matter
+        to the total -- vor_start less vor_flex is one constant per position
+        -- so this counts in roster order rather than sorting.
         """
-        return sum(self.vor[i] for i in roster)
+        used = [0] * N_POS
+        total = 0.0
+        for i in roster:
+            pc = self.pc[i]
+            if used[pc] < self.starts[pc]:
+                used[pc] += 1
+                total += self.vor_start[i]
+            else:
+                total += self.vor_flex[i]
+        return total
 
     def lineup_slots(self, roster):
         """Which slot each player fills: START, FLEX or bench.
@@ -380,18 +439,25 @@ class Engine:
     def finish(self, boards, scores, order, counts, user_team, roster, gone):
         """Play `order` out greedily and return the user team's final roster.
 
+        Every team takes the best player its own board allows, which is
+        League.on_board and not League.legal: a team that has its starting
+        quarterback drafts past the rest of them rather than spending a
+        pick on a backup. The user's team is drafted the same way here --
+        the candidate being priced is forced on at the top of chunk(), and
+        after that this is simply what the seat would do.
+
         `gone` and `counts` are consumed, so callers hand over copies. Only
         the user's roster is collected -- nothing else is reported on, and
         building twelve rosters per simulation is pure cost.
         """
-        legal = self._legal_cached
+        board = self._board_cached
         pc = self.pc
         heads = [[0] * N_POS for _ in range(self.lg.n_teams)]
         roster = list(roster)
         for team in order:
             c = counts[team]
             i = best_available(
-                boards[team], heads[team], scores[team], gone, legal(tuple(c))
+                boards[team], heads[team], scores[team], gone, board(tuple(c))
             )
             if i < 0:
                 # A roster entered by hand -- draft_tool.py's --no-mock-draft

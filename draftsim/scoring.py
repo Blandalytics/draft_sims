@@ -19,9 +19,10 @@ The file is flat JSON and carries only what differs from the default:
 The rules go two places, and the point of holding them in one object is that
 those two cannot drift apart:
 
-    into R, where projections_table() scores each source's projection into
-      the points board -- the rules also decide which component stats come
-      back at all, since a category worth nothing is never aggregated
+    into calc_projections, where projections_table() scores each source's
+      projection into the points board -- the rules also decide which
+      component stats come back at all, since a category worth nothing is
+      never aggregated
     into vor_draft_sim, which scores the component stats it samples on the
       Python side, a fresh season per simulated draft
 
@@ -36,13 +37,14 @@ the names below are its names. `all_pos = TRUE` means the category counts
 for every position rather than only the obvious one -- a quarterback's
 receptions, a receiver's passing touchdowns.
 
-One rule is carried but inert. `pts_bracket`, which pays a defense on the
-points it allows, is passed to R and scored there, but no source
-ffanalytics scrapes projects points allowed: measured against the published
-board, every defense's points are exactly the sum of its other categories,
-the bracket contributing nothing. It is kept because the rules should say
-what the league does, and because a source that starts projecting it would
-then be scored correctly with no change here.
+One rule is carried but inert, and the reason is worth knowing. The sliding
+scale a defense is paid on, `pts_bracket`, is scored -- the sources do
+project points allowed -- but what the bracket produces is then multiplied
+by `dst_pts_allowed`, which is 0 here as it is in Yahoo's rules and in
+ffanalytics'. So every defense's points are exactly the sum of its other
+categories, as the published board shows. Set `dst_pts_allowed` to 1 and the
+bracket pays what it says; the rules are kept whole either way, so that a
+league that does pay for it is scored correctly.
 """
 
 import argparse
@@ -157,12 +159,6 @@ def _plain(v):
     return "%g" % v
 
 
-def _r_value(v):
-    if isinstance(v, bool):
-        return "TRUE" if v else "FALSE"
-    return repr(float(v))
-
-
 def _canon(rules):
     """A rule set as one string, so two of them compare and hash alike.
 
@@ -201,11 +197,11 @@ def override(rules, changes):
 class Scoring:
     """One league's scoring rules, and the two forms they are needed in.
 
-    `values` is the flat category -> points table the Python side scores
-    sampled stats with, holding only what is worth something; `r_block()` is
-    the same rules as the R list projections_table() takes. `key` is what
-    tells two rule sets' cached projections apart, and is empty for the
-    default so that the published cache keeps its name.
+    `values` is the flat category -> points table both the aggregation and
+    the simulators score with, holding only what is worth something, and
+    `rules` is the whole rule set including the categories worth nothing.
+    `key` is what tells two rule sets' cached projections apart, and is
+    empty for the default so that the published cache keeps its name.
     """
 
     def __init__(self, rules=None):
@@ -253,29 +249,6 @@ class Scoring:
         }
         out[BRACKET] = self.rules[BRACKET]
         return out
-
-    def r_block(self):
-        """The rules as the R `scoring` list projections_table() takes."""
-        lines = []
-        for group, rules_of in self.rules.items():
-            if group == BRACKET:
-                continue
-            body = ", ".join(
-                "%s = %s" % (k, _r_value(v)) for k, v in rules_of.items()
-            )
-            lines.append("  %s = list(%s)" % (group, body))
-        lines.append(
-            "  %s = list(%s)"
-            % (
-                BRACKET,
-                ", ".join(
-                    "list(threshold = %s, points = %s)"
-                    % (_r_value(t), _r_value(p))
-                    for t, p in self.rules[BRACKET]
-                ),
-            )
-        )
-        return "scoring <- list(\n" + ",\n".join(lines) + "\n)\n"
 
     def table(self):
         """The rules as lines to print: what pays, and what was changed."""
