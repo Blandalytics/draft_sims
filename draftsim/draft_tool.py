@@ -116,6 +116,13 @@ MY_WEIGHT = 0.6  # the VOR/ADP blend the board is shown to you in
 SEED = 960122  # fixed, so the same flags give the same draft
 N_OPTIONS = 10  # options priced per pick, however they break down
 TOP_POS = ("QB", "RB", "WR", "TE")
+# How a roster reads: the starting lineup by position, then the flex, then
+# the two team units, then the bench. The kicker and the defense come after
+# the flex rather than with the other starters because that is the order a
+# lineup is set in -- the flex is a decision about the skill positions, and
+# by the time it is made the other two have long since picked themselves.
+SEAT_POS = ("QB", "RB", "WR", "TE", K, DEF)
+SEAT_GROUP = {"FLEX": 1, "bench": 3}
 
 
 class Draft:
@@ -329,12 +336,21 @@ def fmt_player(e, width=22):
     return "%-*s %-3s %-4s" % (width, e["name"][:width], e["pos"], e["nfl"])
 
 
+def seat(eng, i, slot):
+    """Where a player sits in a printed roster -- see SEAT_POS."""
+    pos = eng.entries[i]["pos"]
+    group = SEAT_GROUP.get(slot, 2 if pos in (K, DEF) else 0)
+    return (group, SEAT_POS.index(pos), -eng.proj[i])
+
+
 def show_roster(draft, team, label=None):
+    """A roster on one line, by position: no slots, since mid-draft there
+    are none to speak of -- who starts is not settled until the last pick."""
     e = draft.eng.entries
     proj = draft.eng.proj
     ids = sorted(
         draft.rosters[team],
-        key=lambda i: (DRAFTABLE.index(e[i]["pos"]), -proj[i]),
+        key=lambda i: (SEAT_POS.index(e[i]["pos"]), -proj[i]),
     )
     head = label or ("team %d" % (team + 1))
     if not ids:
@@ -530,29 +546,50 @@ def show_final(draft, mock=True):
     mine = draft.rosters[draft.user_team]
     slots = eng.lineup_slots(mine)
     print("\n  your roster")
-    for i in sorted(
-        mine, key=lambda i: (DRAFTABLE.index(e[i]["pos"]), -eng.proj[i])
-    ):
+    for i in sorted(mine, key=lambda i: seat(eng, i, slots[i])):
         print(
             "    %-6s %-31s %8.1f" % (slots[i], fmt_player(e[i]), eng.proj[i])
         )
     print(
-        "\n  starting lineup, flex included: %.1f projected points"
-        % eng.lineup_points(mine)
+        "\n  starting lineup, flex included: %.1f projected points;"
+        " bench %.1f vor" % (eng.lineup_points(mine), eng.bench_vor(mine))
     )
-    print("\n  every team's projected starting points")
-    tot = [(eng.lineup_points(r), t) for t, r in enumerate(draft.rosters)]
-    for k, (pts, t) in enumerate(sorted(tot, reverse=True), start=1):
+    show_teams(draft, mock)
+
+
+def show_teams(draft, mock=True):
+    """Every team's finished roster, best starting lineup first.
+
+    Two numbers, because a draft is two things at once. The starting points
+    are what the season is played with, and they are what the table is
+    sorted on. The bench VOR is what is behind them -- priced against the
+    flex line, which is the slot a bench player is really competing for --
+    and it is where two teams with the same lineup stop being the same
+    team.
+    """
+    eng = draft.eng
+    rows = [
+        (eng.lineup_points(r), eng.bench_vor(r), t)
+        for t, r in enumerate(draft.rosters)
+    ]
+    print("\n  every team, by projected starting points")
+    print(
+        "    %2s  %-7s%s %9s %9s"
+        % ("#", "team", "  vor w" if mock else "", "start pts", "bench vor")
+    )
+    for k, (pts, bench, t) in enumerate(
+        sorted(rows, key=lambda r: -r[0]), start=1
+    ):
         you = t == draft.user_team
         # a weight only means something for a team the tool drafted
         w = (
             ""
             if not mock
-            else "  w %-5s" % ("-" if you else "%.2f" % draft.weights[t])
+            else "  %-5s" % ("-" if you else "%.2f" % draft.weights[t])
         )
         print(
-            "    %2d.  team %-2d%s %8.1f%s"
-            % (k, t + 1, w, pts, "  <- you" if you else "")
+            "    %2d  team %-2d%s %9.1f %9.1f%s"
+            % (k, t + 1, w, pts, bench, "  <- you" if you else "")
         )
 
 

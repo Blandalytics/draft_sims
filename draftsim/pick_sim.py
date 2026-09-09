@@ -369,6 +369,18 @@ class Engine:
                 total += self.vor_flex[i]
         return total
 
+    def bench_vor(self, roster):
+        """Value over replacement of the players who do not start.
+
+        The other half of what a finished roster is worth: lineup_points
+        counts the eleven who play, this counts the four or five behind
+        them. Every one of them is beyond his position's starting
+        allotment, that being what put him on the bench, so every one is
+        priced on vor_flex -- the same component roster_vor would give him.
+        """
+        slots = self.lineup_slots(roster)
+        return sum(self.vor_flex[i] for i in roster if slots[i] == "bench")
+
     def lineup_slots(self, roster):
         """Which slot each player fills: START, FLEX or bench.
 
