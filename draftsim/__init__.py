@@ -3,12 +3,15 @@
 Three simulators and an interactive front end, sharing one league definition
 and one player pool:
 
-    league          the league's shape and its roster rules, which everything
-                    else is priced against
+    league          the league: its shape, its roster rules and its scoring,
+                    which everything else is priced against
+    scoring         what each stat pays -- Yahoo's default, 0.5 PPR, until
+                    the league says otherwise
     adp             the market, scraped from nfc.shgn.com over a window that
                     defaults to the last fourteen days
     projections     projected points and the component stats behind them,
-                    pulled out of the ffanalytics R package
+                    pulled out of the ffanalytics R package and scored by
+                    the league's rules
     draft_sim       drafts off simulated ADP: a skew normal per player, fitted
                     to his published ADP, range and pick count
     vor_draft_sim   drafts off sampled projections: a season drawn per player
@@ -26,7 +29,8 @@ Run the tool with `python -m draftsim`, and any simulator on its own with
 
 No data ships with the package. Both inputs move -- the market daily, the
 projections whenever a source updates -- so both are fetched on demand and
-cached under DRAFTSIM_CACHE, or ~/.cache/draftsim. Simulators write their
+cached under DRAFTSIM_CACHE, or ~/.cache/draftsim, the projections under a
+name that carries the scoring they were built with. Simulators write their
 output to the current working directory.
 """
 

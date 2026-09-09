@@ -72,7 +72,10 @@ Commands on the clock:
     q           quit
 
 League shape comes from league.py and the shared --teams/--roster/--qb...
-flags, so this drafts the same league combined_draft.py simulates.
+flags, so this drafts the same league combined_draft.py simulates. Scoring is
+a league setting like the rest of them -- Yahoo's default, 0.5 PPR, until
+--score rec=1 or --scoring my_league.json says otherwise -- and changing it
+rebuilds the board it prices you against. See scoring.py.
 """
 
 import argparse
@@ -849,7 +852,7 @@ def main(argv=None):
     # scraped once here and handed down, so the workers below read the
     # board this process pulled rather than each pulling its own
     adp_path = adp.path_from_args(a)
-    source = projections_from_args(a, adp_path)
+    source = projections_from_args(a, adp_path, scoring=lg.scoring)
     print("loading the board...", end=" ", flush=True)
     board = combined_draft.Board(lg, a.matched_only, adp_path, source)
     eng = pick_sim.Engine(board, lg, a.vor_weight_lo, a.vor_weight_hi)
@@ -863,8 +866,15 @@ def main(argv=None):
     rng = np.random.default_rng(a.seed)
     draft = Draft(eng, a.slot - 1, rng, a.my_weight, a.options)
     print(
-        "%s: %d teams x %d rounds, you are team %d (seed %d)"
-        % (lg.name, lg.n_teams, lg.roster, a.slot, a.seed)
+        "%s: %d teams x %d rounds, you are team %d (seed %d), scoring %s"
+        % (
+            lg.name,
+            lg.n_teams,
+            lg.roster,
+            a.slot,
+            a.seed,
+            lg.scoring.summary(),
+        )
     )
     if a.mock_draft:
         print(

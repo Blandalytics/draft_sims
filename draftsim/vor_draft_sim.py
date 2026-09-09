@@ -4,7 +4,8 @@ Each draft draws one simulated season for every player by sampling each
 scored component stat independently,
     stat ~ Normal(stat, stat_sd), clipped at 0,
 from the `average` avg_type rows projections.py pulls out of ffanalytics,
-then scoring the draw with Yahoo default values (0.5 PPR). So a player's
+then scoring the draw by the league's own rules -- Yahoo's default, 0.5 PPR,
+unless the league says otherwise; see scoring.py. So a player's
 points come from his own passing/rushing/receiving draws rather than from
 one aggregate number,
 and each draft gets its own board. Replacement levels are then recomputed from
@@ -62,30 +63,6 @@ from .league import (
 POINTS_AVG_TYPE = "robust"  # the reconciliation the points board uses
 STATS_AVG_TYPE = "average"  # and the one its component stats use
 
-# Yahoo default scoring, applied to the sampled component stats.
-# help.yahoo.com/kb/default-league-settings-fantasy-football-sln6489.html
-YAHOO_POINTS = {
-    "pass_yds": 0.04,
-    "pass_tds": 4,
-    "pass_int": -1,
-    "rush_yds": 0.1,
-    "rush_tds": 6,
-    "rec": 0.5,
-    "rec_yds": 0.1,
-    "rec_tds": 6,
-    "fumbles_lost": -2,
-    "fg_0019": 3,
-    "fg_2029": 3,
-    "fg_3039": 3,
-    "fg_4049": 4,
-    "fg_50": 5,
-    "xp": 1,
-    "dst_int": 2,
-    "dst_fum_rec": 2,
-    "dst_sacks": 1,
-    "dst_safety": 2,
-    "dst_td": 6,
-}
 OUT_PICKS = "vor_draft_results.parquet"
 OUT_SUMM = "vor_draft_summary.csv"
 
@@ -140,17 +117,19 @@ def load_players(source):
 def load_stats(source):
     """Component stat means and SDs, keyed by player id.
 
-    Only the columns Yahoo actually scores are kept, and only those the
-    package returned -- a category worth no points is not aggregated. A blank
-    stat is 0, and so is a blank SD, which treats that component as certain
-    rather than dropping the player over it.
+    Only the columns the league actually scores are kept, and only those the
+    package returned -- a category worth no points is not aggregated, and one
+    no source projects (a two-point conversion, a blocked kick) does not come
+    back however it is scored. A blank stat is 0, and so is a blank SD, which
+    treats that component as certain rather than dropping the player over it.
     """
     rows = [r for r in source.stats if r["avg_type"] == STATS_AVG_TYPE]
     if not rows:
         raise SystemExit(
             "projections carried no %s stat rows" % STATS_AVG_TYPE
         )
-    cols = [c for c in YAHOO_POINTS if c in rows[0] and c + "_sd" in rows[0]]
+    values = source.scoring.values
+    cols = [c for c in values if c in rows[0] and c + "_sd" in rows[0]]
 
     def num(v):
         try:
@@ -287,7 +266,9 @@ def load_board(source=None):
     # component stat matrices: one row per player, one column per scored stat
     MU = np.array([stats[p["id"]][0] for p in players], dtype=np.float64)
     SD = np.array([stats[p["id"]][1] for p in players], dtype=np.float64)
-    W = np.array([YAHOO_POINTS[c] for c in stat_cols], dtype=np.float64)
+    W = np.array(
+        [source.scoring.values[c] for c in stat_cols], dtype=np.float64
+    )
 
     # the projection each player's sampled points vary around, and the SD that
     # follows from the components (treating the components as independent)
@@ -522,6 +503,7 @@ def describe(players, pos_of, stat_cols, dropped, lg):
             "dropped %d players with no %s stat line"
             % (len(dropped), STATS_AVG_TYPE)
         )
+    print("scoring: %s" % lg.scoring.summary())
     print(
         "%s: %d teams x %d spots = %d picks per draft, %d drafts\n"
         % (lg.name, lg.n_teams, lg.roster, lg.n_teams * lg.roster, N_DRAFTS)
@@ -561,4 +543,5 @@ if __name__ == "__main__":
         )
     )
     _a = ap.parse_args()
-    run(league_from_args(_a), projections.from_args(_a))
+    _lg = league_from_args(_a)
+    run(_lg, projections.from_args(_a, scoring=_lg.scoring))

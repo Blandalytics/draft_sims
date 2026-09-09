@@ -1,17 +1,24 @@
-"""League and roster rules for the snake drafts.
+"""A league: its roster rules and its scoring, which are one setting each.
 
 Split out of draft_sim.py so that anything drafting off a board --
 combined_draft.py, say -- can reuse the exact same legality checks without
 dragging in numpy, pyarrow and scipy. Nothing here imports anything but
-functools.
+functools and scoring.py, which imports nothing at all.
 
 One league configuration serves all three simulators. DEFAULT is it -- 12
 teams and 15 spots: 1 QB, 2 RB, 3 WR, 1 TE, 1 FLEX (RB/WR/TE), 1 DST, 1 K,
-5 bench -- and add_league_args/league_from_args give every script the same
-flags to override it. draft_sim.py and
-vor_draft_sim.py must agree on the league, since combined_draft.py blends
+5 bench, scored by Yahoo's default rules -- and add_league_args /
+league_from_args give every script the same flags to override it. draft_sim.py
+and vor_draft_sim.py must agree on the league, since combined_draft.py blends
 their two boards and drafts the result: a VOR rank priced against one league's
 replacement levels is meaningless in another league's draft.
+
+Scoring belongs here for the same reason the roster does. Both are the
+league's, both are set with the same flags, and a board is only worth
+anything in the league it was priced for -- what a receiver is worth depends
+on whether the league pays a point a catch as surely as it depends on how
+many receivers a team starts. What each category pays lives in scoring.py;
+League carries the rules, and projections.py builds the board from them.
 
 Each simulator keeps its own pick heuristic (draft_sim takes the lowest
 simulated ADP slot, vor_draft_sim the highest VOR); only the league -- team
@@ -29,6 +36,9 @@ The rules and draft-order policy that follow from a league:
 
 from functools import lru_cache
 
+from .scoring import Scoring, add_scoring_args
+from .scoring import from_args as scoring_from_args
+
 DEF = "DST"  # defense/special teams
 K = "K"  # kicker
 # K and DST are streamed, so vor_draft_sim pins their replacement baselines
@@ -45,14 +55,22 @@ class League:
     Everything past the starting lineup is derived: the flex requirement, the
     QB/TE caps and the bench size all fall out of `starters`, `n_flex` and
     `roster`, so a league is defined once and cannot disagree with itself.
+
+    `scoring` is the other half of what a league is -- what each stat pays.
+    Nothing here uses it, since roster legality does not care what a catch
+    is worth; it is carried because it is the league's, and because
+    everything that prices a player against this league takes the league.
     """
 
-    def __init__(self, name, n_teams, roster, starters, n_flex=1):
+    def __init__(
+        self, name, n_teams, roster, starters, n_flex=1, scoring=None
+    ):
         self.name = name
         self.n_teams = n_teams
         self.roster = roster
         self.starters = dict(starters)
         self.n_flex = n_flex
+        self.scoring = scoring or Scoring()
         # RB/WR/TE bodies a legal roster owes: each position's own starters
         # plus the flex slots they share
         self.flex_total = sum(starters[p] for p in FLEX_POS) + n_flex
@@ -232,6 +250,7 @@ def add_league_args(ap):
         "league settings",
         "shared by draft_sim, vor_draft_sim and combined_draft",
     )
+    add_scoring_args(ap)  # the league's scoring, in its own group
     g.add_argument("--teams", type=int, default=DEFAULTS["teams"])
     g.add_argument(
         "--roster",
@@ -256,13 +275,15 @@ def add_league_args(ap):
 
 
 def league_from_args(a):
-    """Build the League those flags describe."""
+    """Build the League those flags describe, scoring and all."""
     starters = {p: getattr(a, p.lower()) for p in ("QB", "RB", "WR", "TE")}
+    scoring = scoring_from_args(a)
     same = (
         a.teams == DEFAULTS["teams"]
         and a.roster == DEFAULTS["roster"]
         and a.flex == DEFAULTS["flex"]
         and all(starters[p] == DEFAULTS[p] for p in starters)
+        and scoring.is_default()
     )
     return League(
         "default" if same else "custom",
@@ -270,4 +291,5 @@ def league_from_args(a):
         roster=a.roster,
         starters=starters,
         n_flex=a.flex,
+        scoring=scoring,
     )

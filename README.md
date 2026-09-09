@@ -37,7 +37,8 @@ draftsim/
     __main__.py         `python -m draftsim` -> the draft tool
     adp.py              scrapes the ADP board from nfc.shgn.com
     projections.py      pulls projections out of the ffanalytics R package
-    league.py           the league's shape and its roster rules
+    league.py           the league: its roster rules and its scoring
+    scoring.py          what each stat pays, and the flags that set it
     draft_sim.py        drafts off simulated ADP
     vor_draft_sim.py    drafts off sampled projections, by VOR
     combined_draft.py   blends the two boards and drafts the result
@@ -56,6 +57,7 @@ python -m draftsim.vor_draft_sim        # 10,000 drafts off sampled VOR
 python -m draftsim.combine_ranks        # blend the two summaries into a board
 python -m draftsim.adp                  # just pull the ADP board and print it
 python -m draftsim.projections          # just build the projections and stop
+python -m draftsim.scoring              # print the scoring rules in force
 ```
 
 No data ships with the package. Output (the parquet pick logs and the summary
@@ -108,6 +110,39 @@ already handle.
 
 Both caches mean a draft's twelve worker processes share one fetch between
 them, and a cached board stands in if a source cannot be reached.
+
+## Scoring
+
+Scoring is a league setting, alongside the roster — what a receiver is worth
+depends on whether the league pays a point a catch as surely as on how many
+receivers a team starts. It defaults to Yahoo's rules, 0.5 PPR, and is set
+one category at a time or as a whole:
+
+```bash
+python -m draftsim --score rec=1                 # full PPR
+python -m draftsim --score rec=1,pass_tds=6      # ...and 6-point passing
+python -m draftsim --scoring my_league.json      # a whole rule set
+python -m draftsim.scoring                       # the rules in force
+python -m draftsim.scoring --json > my_league.json    # a file to edit
+```
+
+A scoring file is flat JSON carrying only what differs from the default —
+`{"rec": 1, "pass_tds": 6}` — and the category names are ffanalytics', which
+`python -m draftsim.scoring` lists.
+
+Changing the scoring changes the projections, so the board is rebuilt and
+cached under its own name; the plain filename stays the default rules', which
+is the one published here. On a machine with R that means a fresh scrape. On
+one without — a Colab notebook — the published *component stats* are scored
+locally instead, which is exact for the `average` and `weighted`
+reconciliations and approximate for `robust`: see `projections.rescore()`,
+which says what the difference is and why.
+
+Two rules are worth knowing. The scoring the projections were built with
+travels with them, and a board scored by other rules than the league's is
+refused rather than drafted. And `pts_bracket`, which pays a defense on the
+points it allows, is carried through to R but scores nothing today: no source
+ffanalytics scrapes projects points allowed.
 
 ## The draft tool
 

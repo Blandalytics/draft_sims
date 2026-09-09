@@ -78,6 +78,13 @@ class Board:
 
     def __init__(self, lg, matched_only=False, adp_path=None, source=None):
         self.lg = lg
+        if source is not None and source.scoring.key != lg.scoring.key:
+            # a board priced by one league's rules cannot be drafted in
+            # another's, and this is the one place both are in hand
+            raise SystemExit(
+                "the projections were scored %s, this league scores %s"
+                % (source.scoring.summary(), lg.scoring.summary())
+            )
         # ADP side: one fitted skew normal per player, as draft_sim fits
         # them. `adp_path` is resolved once by whoever owns the run and
         # handed down, so a pool of workers all read the one board its
@@ -334,6 +341,7 @@ def describe(board, lg, a):
         "per-team vor weight ~ Uniform(%.2f, %.2f), re-rolled each draft"
         % (a.vor_weight_lo, a.vor_weight_hi)
     )
+    print("scoring: %s" % lg.scoring.summary())
     print(
         "%s: %d teams x %d rounds = %d picks per draft, %d drafts\n"
         % (lg.name, lg.n_teams, lg.roster, lg.n_teams * lg.roster, a.drafts)
@@ -490,7 +498,10 @@ def main():
     lg = league_from_args(a)
     board_path = adp.path_from_args(a)
     board = Board(
-        lg, a.matched_only, board_path, projections_from_args(a, board_path)
+        lg,
+        a.matched_only,
+        board_path,
+        projections_from_args(a, board_path, scoring=lg.scoring),
     )
     describe(board, lg, a)
 

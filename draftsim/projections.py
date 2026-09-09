@@ -17,22 +17,26 @@ Both come out of the same call, `projections_table()`, the second with
 the stat-level table with its per-source standard deviations is not a separate
 function, it is the same aggregation returned before it is scored.
 
-Scoring is Yahoo's default, 0.5 PPR, written into the R program below so that
-the run carries its own rules rather than depending on a saved object. It has
-to agree with vor_draft_sim.YAHOO_POINTS, which scores the sampled stats on
-the Python side -- the rules decide which stat columns come back at all, since
-a category worth zero points is not returned.
+Scoring comes from scoring.py -- Yahoo's default, 0.5 PPR, unless the league
+says otherwise -- and is written into the R program so that the run carries
+its own rules rather than depending on a saved object. The same object scores
+the sampled stats on the Python side, in vor_draft_sim, which is the point of
+it being one object: the rules also decide which stat columns come back at
+all, since a category worth zero points is never aggregated.
 
 A scrape takes about two minutes and hits six sites per position, so the
 result is cached under DRAFTSIM_CACHE (or ~/.cache/draftsim) as JSON, keyed by
-season and week, and is looked for in three places in this order:
+season, week and the scoring, and is looked for in this order:
 
     the local cache, if this machine has already built or fetched it
     the copy published at PUBLISHED, which is that same JSON committed to the
       project, and is what lets the tool run where R is not installed -- a
       borrowed laptop, a Colab notebook -- with no R, no ffanalytics and no
-      two-minute wait
+      two-minute wait. Only the default scoring is published
     a fresh scrape out of R
+    failing all of that, on a scoring nobody has published and a machine with
+      no R: the published component stats, scored here under the league's own
+      rules. See rescore(), which says what that costs
 
 `--refresh-projections` skips both caches and insists on the scrape, which is
 the only way to get numbers newer than what is published. Whatever arrives is
@@ -66,6 +70,8 @@ from pathlib import Path
 
 from .adp import add_adp_args, cache_dir
 from .adp import path_from_args as adp_path_from_args
+from .scoring import Scoring, add_scoring_args
+from .scoring import from_args as scoring_from_args
 
 POSITIONS = ("QB", "RB", "WR", "TE", "K", "DST")
 TIMEOUT = 900  # a scrape is ~2 minutes; this is a wide safety margin
@@ -100,42 +106,25 @@ ADP_TEAM = {
     "TBB": "TB",
 }
 SUFFIX = re.compile(r"\b(jr|sr|ii|iii|iv|v)\b\.?", re.I)
+# a cache file's name, and the scoring key in it, which the default leaves off
+CACHE_NAME = re.compile(r"^projections_(\d+)_w(\d+)(?:_([0-9a-f]{8}))?$")
 
-Projections = namedtuple("Projections", "points stats season week")
+Projections = namedtuple("Projections", "points stats season week scoring")
 
-# Yahoo default scoring, 0.5 PPR, and the VOR baselines. These live in the R
-# program because that is where they are applied; vor_draft_sim.YAHOO_POINTS
-# is the same table on the Python side, for scoring the sampled stats.
-R_PROGRAM = r"""
+# The R program, in two halves with the league's scoring rules written in
+# between: scoring.Scoring.r_block() renders that middle. The VOR baselines
+# below are ffanalytics' own and are not the replacement levels draftsim
+# drafts against -- league.py derives those from the league's shape -- so
+# they are left where they are.
+R_HEAD = r"""
 suppressMessages(library(ffanalytics))
 
 args   <- commandArgs(trailingOnly = TRUE)
 season <- as.integer(args[1])
 week   <- as.integer(args[2])
 
-scoring <- list(
-  pass = list(pass_att = 0, pass_comp = 0, pass_inc = 0, pass_yds = 0.04,
-              pass_tds = 4, pass_int = -1, pass_40_yds = 0, pass_300_yds = 0,
-              pass_350_yds = 0, pass_400_yds = 0),
-  rush = list(all_pos = TRUE, rush_yds = 0.1, rush_att = 0, rush_40_yds = 0,
-              rush_tds = 6, rush_100_yds = 0, rush_150_yds = 0,
-              rush_200_yds = 0),
-  rec  = list(all_pos = TRUE, rec = 0.5, rec_yds = 0.1, rec_tds = 6,
-              rec_40_yds = 0, rec_100_yds = 0, rec_150_yds = 0,
-              rec_200_yds = 0),
-  misc = list(all_pos = TRUE, fumbles_lost = -2, fumbles_total = 0,
-              sacks = 0, two_pts = 2),
-  kick = list(xp = 1, fg_0019 = 3, fg_2029 = 3, fg_3039 = 3, fg_4049 = 4,
-              fg_50 = 5, fg_miss = 0),
-  ret  = list(all_pos = TRUE, return_tds = 6, return_yds = 0),
-  dst  = list(dst_fum_rec = 2, dst_int = 2, dst_safety = 2, dst_sacks = 1,
-              dst_td = 6, dst_blk = 2, dst_ret_yds = 0, dst_pts_allowed = 0),
-  pts_bracket = list(
-    list(threshold = 0,  points = 10), list(threshold = 6,  points = 7),
-    list(threshold = 13, points = 4),  list(threshold = 20, points = 1),
-    list(threshold = 27, points = 0),  list(threshold = 34, points = -1),
-    list(threshold = 99, points = -4))
-)
+"""
+R_TAIL = r"""
 baseline <- c(QB = 10, RB = 20, WR = 20, TE = 10, K = 3, DST = 3,
               DL = 10, LB = 10, DB = 10)
 
@@ -165,14 +154,19 @@ out("##STATS", stats)
 """
 
 
+def r_program(scoring):
+    """The R program, scored by this league's rules."""
+    return R_HEAD + scoring.r_block() + R_TAIL
+
+
 def season_now(today=None):
     """The season ffanalytics would call current."""
     d = today or date.today()
     return d.year if d.month >= SEASON_STARTS else d.year - 1
 
 
-def rscript():
-    """Rscript, from the path, DRAFTSIM_RSCRIPT, or a Windows install."""
+def find_rscript():
+    """Rscript, from DRAFTSIM_RSCRIPT, the path, or a Windows install."""
     env = os.environ.get("DRAFTSIM_RSCRIPT")
     if env:
         return env
@@ -182,16 +176,22 @@ def rscript():
     installs = sorted(
         Path("C:/Program Files/R").glob("R-*/bin/Rscript.exe"), reverse=True
     )
-    if installs:
-        return str(installs[0])
-    raise SystemExit(
-        "Rscript not found. draftsim reads its projections out of the "
-        "ffanalytics R package, so R has to be installed and on the path, "
-        "or DRAFTSIM_RSCRIPT set to the Rscript binary."
-    )
+    return str(installs[0]) if installs else None
 
 
-def scrape(season, week=0, timeout=TIMEOUT, quiet=False):
+def rscript():
+    """find_rscript(), or the explanation of why there is nothing to run."""
+    found = find_rscript()
+    if found is None:
+        raise SystemExit(
+            "Rscript not found. draftsim reads its projections out of the "
+            "ffanalytics R package, so R has to be installed and on the "
+            "path, or DRAFTSIM_RSCRIPT set to the Rscript binary."
+        )
+    return found
+
+
+def scrape(season, week=0, scoring=None, timeout=TIMEOUT, quiet=False):
     """Run the R program and read the two tables off its output."""
     if not quiet:
         print(
@@ -206,7 +206,7 @@ def scrape(season, week=0, timeout=TIMEOUT, quiet=False):
     # again, not an artifact of the run.
     with tempfile.TemporaryDirectory(prefix="draftsim-r-") as tmp:
         prog = Path(tmp) / "projections.R"
-        prog.write_text(R_PROGRAM, encoding="utf-8")
+        prog.write_text(r_program(scoring or Scoring()), encoding="utf-8")
         proc = subprocess.run(
             [rscript(), str(prog), str(season), str(week)],
             capture_output=True,
@@ -244,13 +244,33 @@ def _tsv(chunk):
     )
 
 
-def cache_path(season, week):
-    return cache_dir() / ("projections_%d_w%d.json" % (season, week))
+def cache_path(season, week, scoring=None):
+    """Where this season's projections live, under these scoring rules.
+
+    The default scoring adds nothing to the name, so the file this project
+    publishes keeps the name it has always had; every other rule set caches
+    beside it under its own key and cannot be handed a board scored by
+    somebody else's rules.
+    """
+    key = (scoring or Scoring()).key
+    tail = ("_" + key) if key else ""
+    return cache_dir() / ("projections_%d_w%d%s.json" % (season, week, tail))
 
 
-def newest_cached():
+def _name_key(path):
+    """The scoring key in a cache file's name, or None if it is not one."""
+    m = CACHE_NAME.match(path.stem)
+    return (m.group(3) or "") if m else None
+
+
+def newest_cached(key=""):
+    """The most recent cache scored under `key`, or None."""
     found = sorted(
-        cache_dir().glob("projections_*.json"),
+        (
+            p
+            for p in cache_dir().glob("projections_*.json")
+            if _name_key(p) == key
+        ),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -353,28 +373,172 @@ def _write_cache(blob, path):
     os.replace(tmp, path)
 
 
-def _build(season, week, path, quiet):
-    """Scrape, and keep the result. On failure, any cache beats none."""
+def _num(v):
     try:
-        points, stats = scrape(season, week, quiet=quiet)
-    except Exception as exc:
-        stale = newest_cached()
-        if stale is None:
-            raise SystemExit(
-                "could not build projections (%s), and nothing cached or "
-                "published to fall back on." % exc
-            ) from exc
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def rescore(stats, scoring):
+    """A points table scored here, off the component stats.
+
+    The way to score a board by rules nobody has published is to scrape it
+    under those rules, and that is what happens wherever R is installed.
+    This is the other case -- custom scoring on a machine with no R, which
+    is any Colab notebook -- and it works because the component stats are
+    scoring's raw material: what a player is projected to do does not
+    depend on what the league pays for it.
+
+    What it costs is the reconciliation. ffanalytics returns each avg_type
+    twice over, once as reconciled stats and once as reconciled points, and
+    for `average` and `weighted` the two agree exactly -- scoring the
+    reconciled stats gives back the published points to the last decimal,
+    which is what makes this sound. For `robust` they do not: that one
+    reconciles each source's points rather than each source's stats, and
+    the difference reaches 18 points on a quarterback. So a rescored
+    `robust` row is the robust stats scored, not the robust points --
+    a defensible number, and not the same number. --refresh-projections on
+    a machine with R gives the scrape instead.
+
+    `sd_pts` follows the components too, treating them as independent,
+    which is what load_board would do to it anyway.
+    """
+    out = []
+    for r in stats:
+        pts = var = 0.0
+        for c, w in scoring.values.items():
+            if c in r:
+                pts += _num(r[c]) * w
+                var += (_num(r.get(c + "_sd")) * w) ** 2
+        out.append(
+            {
+                "id": r["id"],
+                "avg_type": r["avg_type"],
+                "points": pts,
+                "sd_pts": var**0.5,
+                "first_name": r["first_name"],
+                "last_name": r["last_name"],
+                "team": r["team"],
+                "position": r.get("position.x") or r.get("position", ""),
+            }
+        )
+    return out
+
+
+def _rescored(season, week, quiet, scoring):
+    """The published stats, scored by these rules. None if there are none."""
+    base = None
+    default = cache_path(season, week)
+    if default.exists():
+        base = json.loads(default.read_text(encoding="utf-8"))
+    else:
+        base = fetch_published(season, week, quiet)
+    if base is None:
+        return None
+    missing = [
+        c
+        for c in scoring.diff()
+        if scoring.values.get(c) and c not in base["stats"][0]
+    ]
+    if missing:
         print(
-            "projections: %s\n  falling back on %s" % (exc, stale),
+            "projections: no source projects %s, so scoring it changes "
+            "nothing here. Install R and --refresh-projections to find "
+            "out whether ffanalytics can get it" % ", ".join(missing),
             file=sys.stderr,
         )
-        return json.loads(stale.read_text(encoding="utf-8"))
-    blob = {"season": season, "week": week, "points": points, "stats": stats}
-    _write_cache(blob, path)
+    if not quiet:
+        print(
+            "projections: no R here, so scoring the published component "
+            "stats under your rules -- see projections.rescore()"
+        )
+    return {
+        "season": season,
+        "week": week,
+        "points": rescore(base["stats"], scoring),
+        "stats": base["stats"],
+        "scoring": scoring.rules,
+        "rescored": True,
+    }
+
+
+def _scraped(season, week, quiet, scoring):
+    """A fresh scrape, or None with the reason on stderr."""
+    try:
+        points, stats = scrape(season, week, scoring, quiet=quiet)
+    except Exception as exc:
+        print("projections: %s" % exc, file=sys.stderr)
+        return None
+    return {
+        "season": season,
+        "week": week,
+        "points": points,
+        "stats": stats,
+        "scoring": scoring.rules,
+    }
+
+
+def _stale(scoring):
+    """Any cache scored by these rules -- better than nothing at all."""
+    found = newest_cached(scoring.key)
+    if found is None:
+        return None
+    print("projections: falling back on %s" % found, file=sys.stderr)
+    return json.loads(found.read_text(encoding="utf-8"))
+
+
+def _build(season, week, path, quiet, scoring, refresh=False):
+    """Build the projections, by whatever means this machine has.
+
+    R if it is installed, and it is the only way to a board these rules
+    have never been applied to. Failing that, the published stats scored
+    here, which the default scoring has no use for -- what is published is
+    already scored that way, better. Failing that, any cache at all.
+    """
+    if refresh:
+        rscript()  # insisting on a scrape, so say plainly if there is none
+    blob = _scraped(season, week, quiet, scoring) if find_rscript() else None
+    if blob is None and not scoring.is_default():
+        blob = _rescored(season, week, quiet, scoring)
+    if blob is not None:
+        _write_cache(blob, path)
+        return blob
+    blob = _stale(scoring)
+    if blob is None:
+        raise SystemExit(
+            "no projections for %d week %d under %s: nothing cached, "
+            "nothing published, and no R to build them with (see the "
+            "README)." % (season, week, scoring.summary())
+        )
     return blob
 
 
-def load(season=None, week=0, adp_path=None, refresh=False, quiet=False):
+def _cached(path, season, week, scoring, quiet):
+    """The local cache, or the published copy, or None."""
+    if path.exists():
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        # a rescored cache is the no-R compromise, not the real thing: a
+        # machine that has since found R should scrape rather than keep it
+        if not (blob.get("rescored") and find_rscript()):
+            return blob
+        return None
+    if not scoring.is_default():
+        return None  # only the default rules are published
+    blob = fetch_published(season, week, quiet)
+    if blob is not None:
+        _write_cache(blob, path)
+    return blob
+
+
+def load(
+    season=None,
+    week=0,
+    adp_path=None,
+    refresh=False,
+    quiet=False,
+    scoring=None,
+):
     """The two tables, with pids attached, from the nearest source that has
     them.
 
@@ -383,25 +547,23 @@ def load(season=None, week=0, adp_path=None, refresh=False, quiet=False):
     a machine with ffanalytics on it -- and it is cached locally on arrival,
     so it is fetched once however many worker processes want it.
 
+    `scoring` is the league's, and everything here is keyed on it: nothing
+    but the default rules is published, so a league with its own scoring
+    scrapes its own board, or has the published components scored for it.
+
     `refresh` skips both caches and insists on a scrape, which is the only
     way to get numbers newer than what is published.
     """
+    scoring = scoring or Scoring()
     season = season or season_now()
-    path = cache_path(season, week)
-    blob = None
-    if not refresh:
-        if path.exists():
-            blob = json.loads(path.read_text(encoding="utf-8"))
-        else:
-            blob = fetch_published(season, week, quiet)
-            if blob is not None:
-                _write_cache(blob, path)
+    path = cache_path(season, week, scoring)
+    blob = None if refresh else _cached(path, season, week, scoring, quiet)
     if blob is None:
-        blob = _build(season, week, path, quiet)
+        blob = _build(season, week, path, quiet, scoring, refresh)
     if adp_path is not None:
         attach_ids(blob["points"], adp_path)
     return Projections(
-        blob["points"], blob["stats"], blob["season"], blob["week"]
+        blob["points"], blob["stats"], blob["season"], blob["week"], scoring
     )
 
 
@@ -431,22 +593,31 @@ def add_projection_args(ap):
     return ap
 
 
-def from_args(a, adp_path=None, quiet=False):
+def from_args(a, adp_path=None, quiet=False, scoring=None):
+    """The projections those flags describe.
+
+    `scoring` is the league's -- pass league_from_args(a).scoring, which is
+    where the --score flags land. Without one it reads them itself, for a
+    caller that has no league to speak of.
+    """
     return load(
         a.projections_season,
         a.projections_week,
         adp_path,
         a.refresh_projections,
         quiet,
+        scoring or scoring_from_args(a),
     )
 
 
 def main():
-    ap = add_projection_args(
-        add_adp_args(
-            argparse.ArgumentParser(
-                description=__doc__,
-                formatter_class=argparse.RawDescriptionHelpFormatter,
+    ap = add_scoring_args(
+        add_projection_args(
+            add_adp_args(
+                argparse.ArgumentParser(
+                    description=__doc__,
+                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                )
             )
         )
     )
@@ -454,11 +625,12 @@ def main():
     board = adp_path_from_args(a)
     p = from_args(a, board)
     n = sum(1 for r in p.points if r["pid"])
+    print("scoring: %s" % p.scoring.summary())
     print(
         "season %d week %d: %d players, %d stat rows, %d joined to ADP"
         % (p.season, p.week, len(p.points), len(p.stats), n)
     )
-    print(cache_path(p.season, p.week))
+    print(cache_path(p.season, p.week, p.scoring))
 
 
 if __name__ == "__main__":
